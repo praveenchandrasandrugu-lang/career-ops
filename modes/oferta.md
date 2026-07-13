@@ -6,7 +6,7 @@ When the candidate pastes a job (text or URL), ALWAYS deliver the 7 blocks (A-F 
 
 When the candidate pastes a **URL** (not JD text), confirm the posting is still live before doing any evaluation. A dead link must never reach Block A — a 404/expired page wastes a full A-G evaluation, report, and PDF on phantom content.
 
-1. Get the page content: if you arrived here from `auto-pipeline` (its Step 0.5 already navigated and cleared the link), reuse that snapshot — do not navigate again. On a direct URL entry, navigate with Playwright (`browser_navigate` + `browser_snapshot`) and read the title, URL, and visible content.
+1. Get the page content: if you arrived here from `auto-pipeline` (its Step 0.5 already navigated and cleared the link), reuse that snapshot — do not navigate again. On a direct URL entry, navigate with Playwright (`browser_navigate` + `browser_snapshot`) and read the title, URL, and visible content. **Opt-in:** if `scan.extractor: cli` is set in `config/profile.yml`, run `node browser-extract.mjs <url>` (default `--mode jd`) instead and use its compact `{ "url", "title", "text" }` (the distilled JD main text rather than the full page a11y tree — fewer tokens for the model, board-dependent), **falling back silently** to `browser_navigate` + `browser_snapshot` if it errors or is missing.
 2. Classify the posting:
    - **active posting evidence:** title/role + a real job description or an application/apply path
    - **closed posting evidence:** expired/closed/"no longer accepting applications", missing JD with only nav/footer, hard redirect to a generic careers/search page, or 404/410
@@ -14,6 +14,15 @@ When the candidate pastes a **URL** (not JD text), confirm the posting is still 
 4. If the candidate pasted JD text (no URL), liveness cannot be verified — note that and proceed; there is no link to check.
 
 Do not continue to Block A until this gate is resolved. The snapshot captured here is reused by Block G's freshness signals.
+
+## Blacklist gate (#1742)
+
+If `data/blacklist.md` exists, check the posting's company against it before Block A. The file is the candidate's own do-not-apply list (user layer, opt-in): absent file = no gate, and nothing ever adds a company to it automatically. Match case- and punctuation-insensitively — "Acme Corp." on the list catches a JD that says "acme corp".
+
+1. On a hit, **stop before Block A** and surface the candidate's own recorded decision:
+   > "{Company} is on your blacklist (since {Since}): *{Reason}*. Do you still want me to evaluate this posting?"
+2. Wait for an explicit answer — never silently refuse, never silently proceed. The candidate's call always wins (same HITL spirit as the score < 4.0 rule): an explicit yes runs the full A-G evaluation as normal (note the override in the report notes); anything else stops here with no evaluation, report, or CV.
+3. No match, or no `data/blacklist.md` → proceed. A blacklist entry never changes any score anywhere — it is a gate, not a signal.
 
 ## Bounded Research Budget
 
@@ -93,7 +102,69 @@ Use the bounded research budget above for:
 - Company's compensation reputation
 - Demand trend for the role
 
-Table with data and cited sources. If there is no data, state it instead of inventing.
+Before interpreting any salary number, classify the company type. Public compensation ranges are not equally reliable across company categories.
+
+**Company type classification (required):**
+
+Classify the employer into the closest category and state the confidence level:
+
+| Company type | Typical comp reliability | Signals |
+|--------------|--------------------------|---------|
+| Public big tech / mature tech | High to medium | Public company, structured levels, large engineering org, repeatable hiring process |
+| Growth-stage startup / VC-backed startup | Medium | Funded startup, competitive hiring market, may mix base + equity + bonus |
+| Early-stage startup / pre-revenue startup | Medium to low | Small team, vague role scope, equity-heavy promises, unclear bands |
+| Enterprise / traditional corporate | Medium | Formal HR process, stable base, slower bands, bonus may be discretionary |
+| Agency / outsourcing / consulting vendor | Medium to low | Client allocation, project-based work, billability pressure, variable bonus |
+| Local SMB / service business | Low | Small company, broad role, informal HR, "comprehensive salary" language |
+| Sales / commission-heavy org | Low unless base is explicit | "OTE", "uncapped", commission, performance bonus, target-based pay |
+| Recruiter / staffing listing | Low to medium | Third-party posting, range may reflect client budget rather than offer terms |
+| Government / academic / nonprofit | Medium to high | Published grades/bands, but lower market competitiveness |
+| Open-source community / education community | Medium to low | Community-led org, foundation/association sponsor, campus/community operations, unclear employment entity |
+
+If the company type is uncertain, mark it as `Unknown` and default compensation reliability to the conservative canonical tier: `Low` until evidence improves it.
+
+If the brand differs from the legal employer or posting entity, classify the **actual contract / hiring entity** first and mention the brand relationship separately. Example: a "Datawhale community" role posted by an association, school, vendor, or partner should be classified by that hiring entity, not by the Datawhale brand alone.
+
+**Compensation reliability (required):**
+
+First check whether the JD itself states a salary figure. If no advertised number exists, collapse this section to exactly two concise lines after the demand trend:
+
+- **Company type:** {category or `Unknown`} — {confidence + one evidence phrase}
+- **Compensation reliability:** {tier} — no advertised salary figure; skip component split, detailed market rows, and HR verification questions
+
+When an advertised salary figure exists, split compensation into:
+
+- **Advertised range:** the salary shown in the JD or public sources
+- **Likely guaranteed base:** conservative estimate of fixed contract salary
+- **Variable / conditional cash components:** bonus, commission, allowance, attendance bonus, KPI bonus, overtime, 13th salary, sign-on, or other cash tied to conditions
+- **Expected stable cash:** what is likely recurring and reliable in cash, before tax unless local data supports a net estimate; exclude benefits
+- **Non-cash benefits:** equity, insurance, pension, meals, transport, wellness, learning budget, equipment, or other benefits that are not guaranteed cash
+
+Add a reliability tier:
+
+| Tier | Meaning |
+|------|---------|
+| High | Salary is stated as base or backed by structured public bands / multiple consistent sources |
+| Medium | Range is plausible but components are not fully separated |
+| Low | Public number likely includes variable, attendance, commission, subsidy, or "up to" components |
+| Unknown | No usable salary data |
+
+Treat these phrases as low-reliability signals unless the fixed base is explicitly separated: "comprehensive salary", "total package", "up to", "OTE", "uncapped", "including allowances", "performance bonus included", "attendance bonus", "KPI bonus", "base + variable", "base + commission", "13th salary included", or unusually wide salary ranges.
+
+When the advertised number may be inflated, say so plainly. Example: `Advertised 5k may represent 3k base + attendance / KPI / subsidy components; verify contract base before treating it as a 5k role.`
+
+**Required HR verification questions when a salary figure exists:**
+
+Include 3-6 concrete questions tailored to the JD and company type, such as:
+
+- What is the fixed base salary written in the employment contract?
+- Does the advertised range include bonus, commission, allowances, overtime, attendance, or KPI components?
+- Is probation salary discounted?
+- Are social insurance / pension / benefits calculated from base salary or full compensation?
+- Which components are guaranteed monthly versus discretionary or target-based?
+- If equity or bonus is mentioned, what is the vesting schedule, payout history, and realistic expected value?
+
+When a salary figure exists, include a table with data and cited sources. If there is no data beyond the JD figure, state it instead of inventing. Do not present advertised compensation as real take-home pay unless the source explicitly supports that interpretation.
 
 The table's **first row is always the JD's own advertised figure, verbatim** — before any researched market data:
 
@@ -189,6 +260,22 @@ If this combination is present, append a short, non-alarmist note to the report 
 > ⚠️ **Employment classification signal:** This posting uses language associated with contractor/services status rather than standard employee status — e.g. "{specific phrase found}". If eligibility for programs like CEC/PR depends on employee status, or if you want statutory benefits, deductions, and protections, confirm classification directly with the employer before accepting.
 
 This signal does not change the High Confidence / Proceed with Caution / Suspicious tier below — it is orthogonal to ghost-job detection and is reported separately.
+
+**7. AI-Buzzword vs. Infrastructure Mismatch** (from JD text, plus Block D research already gathered — no additional queries):
+
+Some JDs describe the company the org *wants to become*, not the org as it is: heavy "AI enablement / digital transformation / process innovation" language sitting on top of infrastructure that is nowhere near ready for it. The candidate finds out only after burning a prescreen (or more) that the "AI" role is really digitization and backlog-cleanup work first, AI work maybe eventually. That can still be a fine role — but the candidate should know before applying, not after.
+
+Check the JD for these three signal classes:
+
+- **Buzzword density vs. role scope:** AI/transformation/innovation/enablement language is prominent, but the actual seniority, title, or listed responsibilities don't match ownership of transformation outcomes (e.g., a mid-level individual-contributor role expected to "drive AI transformation across the organization").
+- **Team-size mismatch:** the JD mentions a small team (roughly 5 people or fewer) expected to own "transformation" outcomes for a large org — a common tell that the mandate outstrips the resourcing.
+- **Industry base rate:** the company is in a traditional/legacy-heavy industry (manufacturing, aerospace/defense, industrial, heavy logistics) where basic digitization is often still incomplete — AI is being bolted onto a foundation that may not exist yet. This is a base rate, not a verdict: plenty of legacy-industry roles are genuine; it only counts as a signal in combination with the others.
+
+**Only flag when 2+ of the three signal classes are present.** If flagged, append a short, non-alarmist note to the report (descriptive, never prescriptive — this can be exactly the kind of high-impact greenfield role some candidates want):
+
+> ⚠️ **Buzzword/infrastructure mismatch signal:** This JD leans on AI/transformation language ("{specific phrases found}") while {signals observed: small team owning transformation outcomes / scope-seniority mismatch / legacy-heavy industry}. The day-to-day may be foundational digitization and backlog cleanup before any AI work. If you proceed, probe the actual state of their systems directly in interviews — e.g. "What are the top 3 most urgent things this role needs to fix right now?", "Which systems would I be working with, and how mature are they?" — rather than relying on the JD's framing.
+
+This signal does not change the High Confidence / Proceed with Caution / Suspicious tier below — the posting can be entirely real and still oversell its AI maturity. It is orthogonal to ghost-job detection and is reported separately.
 
 ### Output format:
 
