@@ -532,6 +532,67 @@ const urlTextIdx = args.indexOf('--url-text');
 const directUrl = args.find(arg => arg.startsWith('http://') || arg.startsWith('https://'));
 
 // Helper function to enforce egress guard against SSRF (Private/Loopback IPs)
+function isPrivateIpv4(ip) {
+  const o = ip.split('.').map(Number);
+  if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true; // malformed: fail closed
+  return o[0] === 0 || o[0] === 10 || o[0] === 127 ||
+    (o[0] === 100 && o[1] >= 64 && o[1] <= 127) ||           // CGNAT 100.64.0.0/10
+    (o[0] === 169 && o[1] === 254) ||                        // link-local
+    (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+    (o[0] === 192 && o[1] === 168) ||
+    (o[0] === 198 && (o[1] === 18 || o[1] === 19));          // benchmarking 198.18.0.0/15
+}
+
+// Canonical IPv6 parse instead of string-prefix checks: the previous version
+// only recognized the dotted-quad mapped form, so hex-form mapped literals
+// (::ffff:7f00:1 = 127.0.0.1) sailed through the fe8/fc prefix checks.
+// Returns 8 group values, or null on anything malformed (callers fail closed).
+function parseIpv6Groups(v6) {
+  const s = v6.split('%')[0]; // strip zone index (fe80::1%eth0)
+  let body = s;
+  const v4m = /^(.*:)(\d+\.\d+\.\d+\.\d+)$/.exec(s); // embedded IPv4 tail
+  if (v4m) {
+    const o = v4m[2].split('.').map(Number);
+    if (o.length !== 4 || o.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    body = v4m[1] + ((o[0] << 8) | o[1]).toString(16) + ':' + (((o[2] << 8) | o[3]).toString(16));
+  }
+  const parts = body.split('::');
+  if (parts.length > 2) return null;
+  const head = parts[0] ? parts[0].split(':') : [];
+  const tail = parts.length === 2 && parts[1] ? parts[1].split(':') : [];
+  let groups;
+  if (parts.length === 2) {
+    const fill = 8 - head.length - tail.length;
+    if (fill < 1) return null; // '::' must compress at least one group
+    groups = [...head, ...Array(fill).fill('0'), ...tail];
+  } else {
+    groups = head;
+  }
+  if (groups.length !== 8) return null;
+  const nums = groups.map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN));
+  return nums.some(Number.isNaN) ? null : nums;
+}
+
+function isPrivateIpv6(ip) {
+  const g = parseIpv6Groups(ip.toLowerCase());
+  if (!g) return true; // malformed: fail closed
+  const embeddedV4 = () => `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+  if (g.slice(0, 7).every((n) => n === 0) && g[7] <= 1) return true; // :: and ::1
+  if (g.slice(0, 5).every((n) => n === 0) && g[5] === 0xffff) return isPrivateIpv4(embeddedV4()); // ::ffff:0:0/96 mapped (dotted OR hex form)
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((n) => n === 0)) return isPrivateIpv4(embeddedV4()); // 64:ff9b::/96 NAT64
+  if ((g[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 link-local
+  if ((g[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
+  return false;
+}
+
+function isPrivateIp(ip) {
+  return ip.includes(':') ? isPrivateIpv6(ip) : isPrivateIpv4(ip);
+}
+
+// Per-hostname verdict cache: the Playwright route guard validates every
+// subresource request, and re-resolving DNS per request would stall pages.
+const hostVerdicts = new Map();
+
 async function validateUrlSecurity(urlString) {
   const dns = await import('dns/promises');
   const url = new URL(urlString.endsWith('.') ? urlString.slice(0, -1) : urlString);
@@ -540,18 +601,28 @@ async function validateUrlSecurity(urlString) {
   if (hostname === 'localhost' || hostname.endsWith('.local')) {
     throw new Error('Access denied: Localhost or internal domain target detected.');
   }
+  // Literal IP hosts (including bracketed IPv6) never hit DNS — check directly.
+  const literal = hostname.replace(/^\[|\]$/g, '');
+  if (/^[\d.]+$/.test(literal) || literal.includes(':')) {
+    if (isPrivateIp(literal)) throw new Error(`Access denied: Egress guard blocked private target IP ${literal}`);
+    return url.toString();
+  }
+
+  if (hostVerdicts.has(hostname)) {
+    if (hostVerdicts.get(hostname)) return url.toString();
+    throw new Error(`Access denied: Egress guard blocked private target host ${hostname}`);
+  }
 
   const addresses = await dns.resolve(hostname).catch(() => []);
-  const lookupRes = await dns.lookup(hostname).catch(() => null);
-  if (lookupRes) addresses.push(lookupRes.address);
-
-  for (const ip of addresses) {
-    if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.)/.test(ip)) {
-      throw new Error(`Access denied: Egress guard blocked private target IP ${ip}`);
-    }
-    if (ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fc00:') || ip.startsWith('fd00:')) {
-      throw new Error(`Access denied: Egress guard blocked private target IPv6 ${ip}`);
-    }
+  const lookupRes = await dns.lookup(hostname, { all: true }).catch(() => []);
+  for (const r of lookupRes) addresses.push(r.address);
+  if (addresses.length === 0) {
+    throw new Error(`Access denied: could not resolve ${hostname} — failing closed.`);
+  }
+  const blocked = addresses.find((ip) => isPrivateIp(ip));
+  hostVerdicts.set(hostname, !blocked);
+  if (blocked) {
+    throw new Error(`Access denied: Egress guard blocked private target IP ${blocked} (${hostname})`);
   }
   return url.toString();
 }
@@ -574,12 +645,18 @@ if (urlTextIdx !== -1 || directUrl) {
         browser = await chromium.launch({ headless: true });
         const page = await browser.newPage();
 
-        page.on('framenavigated', async (frame) => {
-          if (frame === page.mainFrame()) {
-            await validateUrlSecurity(frame.url()).catch((err) => {
-              console.error(`Security Violation on Redirect: ${err.message}`);
-              process.exit(1);
-            });
+        // Validate EVERY request (navigation, redirect hops, subresources)
+        // before it leaves the browser — a framenavigated listener only fires
+        // after the request has already reached the target.
+        await page.route('**/*', async (route) => {
+          try {
+            await validateUrlSecurity(route.request().url());
+            await route.continue();
+          } catch (err) {
+            if (route.request().isNavigationRequest()) {
+              console.error(`Security Violation blocked: ${err.message}`);
+            }
+            await route.abort();
           }
         });
 

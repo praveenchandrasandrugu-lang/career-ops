@@ -39,6 +39,7 @@ import lever from './providers/lever.mjs';
 import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
+import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -427,7 +428,14 @@ async function main() {
   // sinceMs once postings are confidently past the --since window, and
   // includeUndated (when false) for a tenant that exposes no postedOn at
   // all, since its postings would all be dropped as undated below anyway.
-  const ctx = { ...makeHttpCtx(), sinceMs: cutoff, includeUndated: opts.includeUndated };
+  // LOCAL CUSTOMIZATION (2026-07-20) — re-apply after `node update-system.mjs`.
+  // A live 400-tenant Workday run lost real jobs to 11+ HTTP 429 truncations.
+  // Providers already retry each page with backoff, but 20 concurrent tenants
+  // share one Workday edge, so per-request backoff can't see fleet-level load.
+  // limiter routes every provider fetch through a shared AIMD window per ATS
+  // family (halve on 429, widen on success, circuit-break on repeated 429s).
+  const limiter = new AdaptiveLimiter({ max: CONCURRENCY });
+  const ctx = { ...limitHttpCtx(makeHttpCtx(), limiter), sinceMs: cutoff, includeUndated: opts.includeUndated };
   const date = new Date().toISOString().slice(0, 10);
 
   const newOffers = [];
@@ -522,6 +530,19 @@ async function main() {
     log(`Undated dropped: ${droppedNoDate}${breakdown}${opts.includeUndated ? '' : '. Use --include-undated to keep'}`);
   }
   log(`New matches:        ${offers.length}`);
+
+  // LOCAL CUSTOMIZATION (2026-07-20) — re-apply after update-system.mjs.
+  // Rate-limit telemetry. A nonzero throttlePct means the ATS pushed back and
+  // the limiter absorbed it; circuitTrips means a family was cut off to stop
+  // the scan burning its budget on doomed retries. finalWindow below CONCURRENCY
+  // shows where that ATS's real tolerance settled.
+  const limitRows = limiter.report().filter((r) => r.throttled > 0 || r.circuitTrips > 0);
+  if (limitRows.length) {
+    log('\nRate limiting (adaptive):');
+    for (const r of limitRows) {
+      log(`  ${r.family}: ${r.throttled}/${r.requests} throttled (${r.throttlePct}%), window ${CONCURRENCY}→${r.finalWindow}, waited ${r.waitedSec}s${r.circuitTrips ? `, circuit tripped ${r.circuitTrips}x` : ''}`);
+    }
+  }
 
   if (offers.length) {
     log('\nNew offers:');
