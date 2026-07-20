@@ -1,0 +1,266 @@
+# portals-harsh.yml — harsh-weather / low-competition state scan preset.
+# Used via:  CAREER_OPS_PORTALS=portals-harsh.yml node scan-ats-full.mjs --since 7
+# (scan-ats-full.mjs walks the FULL public ATS company directories, so no
+#  tracked_companies list is needed here — only filters.)
+#
+# WHY (2026-07-19): thin candidate markets = fewer applicants per req = faster
+# offers. These 16 states are the harsh/low-competition set from
+# everify-check.mjs. Remote roles are deliberately NOT allowed here: a remote
+# req has nationwide competition, which defeats the whole point of this preset.
+# The normal portals.yml scan still covers remote + the rest of the country.
+#
+# Location strings are matched as case-insensitive substrings. ", XX" catches
+# "City, XX"; the full state name catches "North Dakota" / "Remote - Montana".
+# Ambiguous city names (Portland, Burlington, Charleston, Jackson) are omitted
+# on purpose — they collide with bigger cities in other states.
+
+# ── IMPORTANT: how this filter actually matches ──────────────────────
+# scan.mjs's buildLocationFilter() does case-insensitive SUBSTRING matching
+# with NO word boundaries and no regex. That makes short two-letter codes
+# structurally unsafe: a live dry-run on 2026-07-20 proved
+#   ", ME" matches ", Mexico"       (2 Mexican reqs leaked)
+#   ", NE" matches ", New York" / ", Netherlands" / ", Nevada"
+#   ", AR" matches ", Armenia" / ", Argentina" / ", Arlington"
+# So the three ambiguous codes (ME/NE/AR) are NOT in `allow` — those states
+# are covered by their full name plus unambiguous city names instead. The
+# remaining codes (AK ND SD MT WY VT WV KS IA ID MS OK NM) have no common
+# colliding place name. `block` runs before `allow`, so the block list below
+# is the backstop that kills the known collisions outright.
+location_filter:
+  # Checked BEFORE block, so New Mexico survives the "Mexico" block.
+  always_allow:
+    - "New Mexico"
+    - ", NM"
+    - "Albuquerque"
+    - "Santa Fe"
+    - "Las Cruces"
+  allow:
+    # AK
+    - ", AK"
+    - "Alaska"
+    - "Anchorage"
+    - "Fairbanks"
+    # ND
+    - ", ND"
+    - "North Dakota"
+    - "Fargo"
+    - "Bismarck"
+    # SD
+    - ", SD"
+    - "South Dakota"
+    - "Sioux Falls"
+    # MT
+    - ", MT"
+    - "Montana"
+    - "Billings"
+    - "Missoula"
+    - "Bozeman"
+    - "Helena"
+    # WY
+    - ", WY"
+    - "Wyoming"
+    - "Cheyenne"
+    - "Casper"
+    # ME — ", ME" omitted: collides with ", Mexico" / ", Memphis" / ", Merida"
+    - "Maine"
+    - "Bangor"
+    - "Augusta, M"
+    - "Lewiston"
+    # VT
+    - ", VT"
+    - "Vermont"
+    - "Montpelier"
+    # WV
+    - ", WV"
+    - "West Virginia"
+    - "Morgantown"
+    # NE — ", NE" omitted: collides with ", New York" / ", Netherlands" /
+    # ", Nevada" / ", New Jersey" / ", Newark"
+    - "Nebraska"
+    - "Omaha"
+    - "Lincoln, N"
+    # KS
+    - ", KS"
+    - "Kansas"          # also catches "Kansas City, MO" — acceptable: KC metro straddles both
+    - "Wichita"
+    - "Topeka"
+    # IA
+    - ", IA"
+    - "Iowa"
+    - "Des Moines"
+    - "Cedar Rapids"
+    # ID
+    - ", ID"
+    - "Idaho"
+    - "Boise"
+    # MS (also an all-employer E-Verify mandate state — double win)
+    - ", MS"
+    - "Mississippi"
+    - "Gulfport"
+    - "Biloxi"
+    - "Hattiesburg"
+    # AR — ", AR" omitted: collides with ", Argentina" / ", Armenia" /
+    # ", Arlington" / ", Arizona"
+    - "Arkansas"
+    - "Little Rock"
+    - "Bentonville"
+    - "Fayetteville, AR"
+    # OK
+    - ", OK"
+    - "Oklahoma"
+    - "Tulsa"
+    # NM
+    - ", NM"
+    - "New Mexico"
+    - "Albuquerque"
+    - "Santa Fe"
+    - "Las Cruces"
+  block:
+    # -- Remote roles. Deliberate: a remote req competes against the whole
+    # country, which defeats the entire point of a thin-market preset. The
+    # main portals.yml scan still covers remote.
+    - "remote"
+    # -- Known two-letter-code collisions (see header note). These run BEFORE
+    # `allow`, so they kill the false positive even if a code still matches.
+    - "Mexico"          # ", ME" collision. New Mexico rescued by always_allow.
+    - "Memphis"         # ", ME"
+    - "Netherlands"     # ", NE"
+    - "New York"        # ", NE"
+    - "New Jersey"      # ", NE"
+    - "New Hampshire"   # ", NE"
+    - "Nevada"          # ", NE"
+    - "Newark"          # ", NE"
+    - "Argentina"       # ", AR"
+    - "Armenia"         # ", AR"
+    - "Arlington"       # ", AR"
+    - "Arizona"         # ", AR" — mandate state, but not a thin market
+    # -- Non-US
+    - "India"
+    - "United Kingdom"
+    - "Germany"
+    - "Canada"
+    - "Australia"
+    - "Singapore"
+    - "Philippines"
+    - "Costa Rica"
+    - "Brazil"
+    - "Poland"
+    - "Ireland"
+    - "Japan"
+    - "China"
+
+# Role net (widened 2026-07-20 on request: "don't limit to just analyst roles").
+# Derived from config/profile.yml archetypes + cv.md: an M.S. Data Analytics
+# holder with SQL/Python/BI, Accenture reporting-automation experience, and a
+# solo-shipped AI product. Four tiers, all searched:
+#   1. Analyst core   — the validated primary archetype
+#   2. Data/BI/AI     — his degree and OffTheLoop proof
+#   3. Ops/coordinator/specialist — bridge roles, widest net for time-to-offer
+#   4. Adjacent titles that don't say "analyst" but are the same work
+# NOTE: each keyword becomes its own Workday searchText query (see
+# scan-workday-targeted.mjs), so more keywords = better coverage, NOT more
+# noise — the title filter still gates every result.
+title_filter:
+  positive:
+    # -- 1. Analyst core --
+    - "Data Analyst"
+    - "Business Analyst"
+    - "Reporting Analyst"
+    - "Operations Analyst"
+    - "Financial Analyst"
+    - "Research Analyst"
+    - "Program Analyst"
+    - "Inventory Analyst"
+    - "Administrative Analyst"
+    - "Pricing Analyst"
+    - "Supply Chain Analyst"
+    - "Logistics Analyst"
+    - "Quality Analyst"
+    - "Compliance Analyst"
+    - "Marketing Analyst"
+    - "Product Analyst"
+    - "Systems Analyst"
+    - "Process Analyst"
+    - "Revenue Analyst"
+    - "Budget Analyst"
+    - "Planning Analyst"
+    - "Claims Analyst"
+    - "Risk Analyst"
+    - "Fraud Analyst"
+    - "Healthcare Analyst"
+    - "Clinical Analyst"
+    - "Analyst I"
+    - "Analyst II"
+    # -- 2. Data / BI / AI (degree + OffTheLoop) --
+    - "Business Intelligence"
+    - "BI Analyst"
+    - "BI Developer"
+    - "Data Engineer"
+    - "Analytics Engineer"
+    - "Data Specialist"
+    - "Data Scientist"
+    - "Data Coordinator"
+    - "Data Management"
+    - "Data Quality"
+    - "Data Governance"
+    - "Reporting Specialist"
+    - "Report Writer"
+    - "SQL Developer"
+    - "Tableau"
+    - "Power BI"
+    - "AI Engineer"
+    - "Machine Learning"
+    - "Automation Specialist"
+    - "Automation Engineer"
+    # -- 3. Operations / coordinator / specialist bridge roles --
+    - "Operations Coordinator"
+    - "Operations Specialist"
+    - "Business Operations"
+    - "Program Coordinator"
+    - "Project Coordinator"
+    - "Project Analyst"
+    - "Inventory Specialist"
+    - "Inventory Control"
+    - "Supply Chain Specialist"
+    - "Logistics Coordinator"
+    - "Procurement Specialist"
+    - "Billing Specialist"
+    - "Compliance Specialist"
+    - "Quality Specialist"
+    - "Research Coordinator"
+    - "Research Associate"
+    - "Administrative Specialist"
+    - "Office Coordinator"
+    # -- 4. Same work, different label --
+    - "Decision Support"
+    - "Performance Improvement"
+    - "Continuous Improvement"
+    - "Process Improvement"
+    - "Workforce Analytics"
+    - "Revenue Cycle"
+    - "Forecasting"
+    - "Demand Planning"
+    - "Financial Planning"
+    - "Insights Analyst"
+    - "Data Technician"
+    - "Statistician"
+  negative:
+    - "Intern"
+    - "Staff"
+    - "Principal"
+    - "Head of"
+    - "Director"
+    - "VP,"
+    - "Vice President"
+    - "Distinguished"
+    - "Senior Manager"
+    - "Senior Director"
+    - ".NET"
+    - "Java "
+    - "iOS"
+    - "Android"
+    - "Embedded"
+    - "Salesforce Admin"
+    - "SAP "
+    - "Mainframe"
+    - "COBOL"

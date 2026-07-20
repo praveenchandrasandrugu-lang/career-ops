@@ -116,6 +116,9 @@ data/lca/
 data/FY20*/
 # Which careers pages to scan — user config, same trust level as portals.yml.
 data/direct-sites.txt
+# Active harsh-state scan preset (user-tuned). Template ships as
+# templates/portals-harsh.example.yml; the working copy is user layer.
+portals-harsh.yml
 
 # Tool caches (binary, machine-local)
 .tokensave/

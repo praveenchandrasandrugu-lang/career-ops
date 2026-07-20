@@ -279,8 +279,13 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
   }
 
   if (!dry && out.length) {
-    appendToPipeline(out.map((o) => ({ ...o, source: 'workday-targeted' })));
-    appendToScanHistory(out.map((o) => ({ ...o, source: 'workday-targeted' })));
+    // appendToScanHistory(offers, date) needs the scan date as arg 2 — omitting
+    // it writes an empty first_seen column, which shouldDedupScanHistoryRow then
+    // reads as an unparseable date and pins the row as permanently-seen.
+    const date = new Date().toISOString().slice(0, 10);
+    const tagged = out.map((o) => ({ ...o, source: 'workday-targeted' }));
+    appendToPipeline(tagged);
+    appendToScanHistory(tagged, date);
     console.log(`\n✅ ${out.length} added to data/pipeline.md`);
   } else if (dry) {
     console.log('\n(dry run — nothing written)');

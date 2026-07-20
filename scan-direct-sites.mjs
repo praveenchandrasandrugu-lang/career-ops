@@ -249,8 +249,12 @@ function normalize(p, pageUrl, company) {
   }
 
   if (!dry && out.length) {
+    // appendToScanHistory(offers, date) needs the scan date as arg 2 — omitting
+    // it writes an empty first_seen column, which shouldDedupScanHistoryRow then
+    // reads as an unparseable date and pins the row as permanently-seen.
+    const date = new Date().toISOString().slice(0, 10);
     appendToPipeline(out);
-    appendToScanHistory(out);
+    appendToScanHistory(out, date);
     console.log(`\n✅ ${out.length} added to data/pipeline.md`);
   } else if (dry) {
     console.log('\n(dry run — nothing written)');
