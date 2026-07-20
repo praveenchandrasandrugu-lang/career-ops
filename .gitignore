@@ -107,3 +107,18 @@ package-lock.json
 
 # Planning (local scratchpad)
 plan/
+
+# Large derived datasets & local indexes (regenerable from official gov exports —
+# USCIS E-Verify, DOL LCA disclosure files. Huge, licensed, machine-local; never
+# commit. They rebuild via everify-check.mjs index / lca-index.mjs.)
+data/everify/
+data/lca/
+data/FY20*/
+# Which careers pages to scan — user config, same trust level as portals.yml.
+data/direct-sites.txt
+
+# Tool caches (binary, machine-local)
+.tokensave/
+
+# Batch working manifests (per-run job lists, not system code)
+batch/*-manifest.json
