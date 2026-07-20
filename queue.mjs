@@ -1,0 +1,256 @@
+#!/usr/bin/env node
+/**
+ * queue.mjs — SQLite job queue (the scanners' write target).
+ *
+ * Replaces the flat data/pipeline.md as the source of truth for discovered
+ * postings. Scanners upsert normalized rows; dedup becomes a primary-key
+ * lookup instead of three markdown greps that drift; freshness is computed at
+ * READ time from `posted_at` + `posted_at_confidence` (never stored — a stored
+ * bucket rots as `now` advances). pipeline.md becomes a rendered view. Only a
+ * row whose freshness is sendable AND whose gates pass reaches an LLM.
+ *
+ * Same zero-dependency pattern tracker.mjs proved: node:sqlite, Node >= 22.5.
+ *
+ * This file is built incrementally and test-first (tests/queue.test.mjs). The
+ * first landed piece is canonicalizeUrl — the dedup key, and the single
+ * riskiest decision per code review.
+ */
+
+import { classifyFreshness } from './freshness.mjs';
+
+// ── node:sqlite loading (mirrors tracker.mjs) ───────────────────────────────
+//
+// node:sqlite is stable in behavior but still flagged experimental on some Node
+// lines — silence only that one warning, leave every other warning intact.
+async function loadSqlite() {
+  const origEmit = process.emitWarning;
+  process.emitWarning = (warning, ...rest) => {
+    const text = typeof warning === 'string' ? warning : warning?.message || '';
+    if (text.includes('SQLite is an experimental feature')) return;
+    return origEmit.call(process, warning, ...rest);
+  };
+  try {
+    const { DatabaseSync } = await import('node:sqlite');
+    return DatabaseSync;
+  } catch {
+    console.error(`Error: node:sqlite is unavailable. queue.mjs needs Node >= 22.5 (you are on ${process.version}).`);
+    process.exit(1);
+  } finally {
+    process.emitWarning = origEmit;
+  }
+}
+
+// Gate columns carry per-posting screen state; they are PRESERVED across
+// re-scans (an upsert must never wipe an E-Verify result). freshness is NOT a
+// column — it is computed at read time in listReady, because a stored bucket
+// would rot as `now` advances.
+const VALID_CONFIDENCE = new Set(['exact', 'relative_exact', 'lower_bound', 'unknown']);
+// Date-trust ordering: a real age (exact/relative_exact) beats a floor
+// (lower_bound) beats nothing (unknown). Used to stop a re-scan from
+// downgrading or erasing a known date. Mirrored by RANK_SQL in upsertJobs.
+const confRank = (c) => (c === 'exact' || c === 'relative_exact') ? 3 : c === 'lower_bound' ? 2 : 1;
+const sqlEnum = (values) => '(' + [...values].map((v) => `'${v}'`).join(', ') + ')';
+const CONFIDENCES = sqlEnum(VALID_CONFIDENCE);
+const QUEUE_STATES = sqlEnum(['new', 'llm_ready', 'in_progress', 'evaluated', 'skipped', 'failed']);
+// Only `llm_ready` reaches an LLM (queue-plan invariant): a row is drainable
+// once its gates have promoted it out of `new`. `new` rows are pre-gate and
+// must NOT be drained as if ready — the gate step (a later increment) is what
+// moves `new` → `llm_ready` or `skipped`.
+const DRAINABLE_STATES = ['llm_ready'];
+
+/**
+ * Open (and create/migrate) the job-queue database.
+ * @param {string} path  file path, or ':memory:' for tests
+ * @returns {Promise<import('node:sqlite').DatabaseSync>}
+ */
+export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/queue.db') {
+  const DatabaseSync = await loadSqlite();
+  const db = new DatabaseSync(path);
+  // WAL lets concurrent scanners upsert without blocking each other; a busy
+  // timeout rides out the brief writer lock instead of throwing SQLITE_BUSY.
+  // (Both are no-ops / harmless on an in-memory DB.)
+  if (path !== ':memory:') db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      canonical_url          TEXT PRIMARY KEY,
+      raw_url                TEXT NOT NULL,
+      provider_job_id        TEXT,
+      company                TEXT NOT NULL DEFAULT '',
+      title                  TEXT NOT NULL DEFAULT '',
+      source                 TEXT NOT NULL DEFAULT '',
+      posted_at              INTEGER,
+      posted_at_confidence   TEXT NOT NULL DEFAULT 'unknown' CHECK(posted_at_confidence IN ${CONFIDENCES}),
+      first_seen_at          INTEGER NOT NULL,
+      last_seen_at           INTEGER NOT NULL,
+      everify_status         TEXT NOT NULL DEFAULT 'unchecked',
+      sponsorship_status     TEXT NOT NULL DEFAULT 'unchecked',
+      level_status           TEXT NOT NULL DEFAULT 'unchecked',
+      liveness_status        TEXT NOT NULL DEFAULT 'unchecked',
+      required_skill_status  TEXT NOT NULL DEFAULT 'unchecked',
+      missing_required_skills TEXT NOT NULL DEFAULT '[]',
+      queue_status           TEXT NOT NULL DEFAULT 'new' CHECK(queue_status IN ${QUEUE_STATES}),
+      retry_count            INTEGER NOT NULL DEFAULT 0 CHECK(retry_count >= 0),
+      skip_reason            TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_queue_status ON jobs(queue_status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON jobs(posted_at);
+  `);
+  return db;
+}
+
+/**
+ * Upsert discovered postings. Keyed on canonical_url, so a re-scan (or the same
+ * job under different tracking params) UPDATES rather than duplicates. An update
+ * refreshes the volatile fields (title/company/source/date/last_seen_at) but
+ * PRESERVES first_seen_at, every gate status, and queue_status — a re-scan must
+ * never undo screening already done.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<{url:string, company?:string, title?:string, source?:string,
+ *   postedAt?:number|null, confidence?:string, providerJobId?:string}>} offers
+ * @param {{now?:number}} [opts]
+ * @returns {{inserted:number, updated:number, skipped:number}}
+ */
+export function upsertJobs(db, offers, { now = Date.now() } = {}) {
+  const exists = db.prepare('SELECT 1 FROM jobs WHERE canonical_url = ?');
+  const insert = db.prepare(`
+    INSERT INTO jobs (canonical_url, raw_url, provider_job_id, company, title, source,
+      posted_at, posted_at_confidence, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  // On update, a date is overwritten ONLY when the incoming one is usable AND at
+  // least as trustworthy as what is stored — so a re-scan that lost the date
+  // (Workday sometimes drops postedOn) or only carries a weaker "30+ days" lower
+  // bound can never erase or downgrade a known exact date, which would silently
+  // drop the job out of the freshness window. `?` is the incoming trust rank;
+  // RANK_SQL derives the stored row's rank from its own confidence.
+  const RANK_SQL = "(CASE posted_at_confidence WHEN 'exact' THEN 3 WHEN 'relative_exact' THEN 3 WHEN 'lower_bound' THEN 2 ELSE 1 END)";
+  const update = db.prepare(`
+    UPDATE jobs SET raw_url = ?, provider_job_id = COALESCE(?, provider_job_id),
+      company = ?, title = ?, source = ?,
+      posted_at            = CASE WHEN ? >= ${RANK_SQL} THEN ? ELSE posted_at            END,
+      posted_at_confidence = CASE WHEN ? >= ${RANK_SQL} THEN ? ELSE posted_at_confidence END,
+      last_seen_at = ? WHERE canonical_url = ?`);
+
+  let inserted = 0, updated = 0, skipped = 0;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const o of offers) {
+      const canonical = canonicalizeUrl(o.url);
+      if (!canonical) { skipped++; continue; }
+      // Exact-membership check — a substring test against the enum string would
+      // let malformed input like "exact','relative_exact" pass here and then
+      // blow up the whole batch on the DB CHECK.
+      // A confidence is only as good as the date it comes with: a claimed
+      // "exact" with no usable timestamp is effectively unknown. And an unknown
+      // confidence never keeps a date — the invariant `posted_at IS NULL <=>
+      // confidence = 'unknown'` makes the equal-rank overwrite a harmless
+      // null-for-null no-op, so a later unknown re-scan can never NULL a real date.
+      let conf = VALID_CONFIDENCE.has(o.confidence) ? o.confidence : 'unknown';
+      if (!Number.isFinite(o.postedAt)) conf = 'unknown';
+      const postedAt = conf === 'unknown' ? null : o.postedAt;
+      const inRank = confRank(conf);
+      if (exists.get(canonical)) {
+        update.run(o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.source ?? '',
+          inRank, postedAt, inRank, conf, now, canonical);
+        updated++;
+      } else {
+        insert.run(canonical, o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.source ?? '',
+          postedAt, conf, now, now);
+        inserted++;
+      }
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+  return { inserted, updated, skipped };
+}
+
+/**
+ * The drain order an LLM should consume: `llm_ready` rows only (gate-promoted;
+ * `new`/pre-gate rows are excluded), freshness classified at READ time, hot
+ * before fresh before backup, freshest first; stale/unknown excluded (never
+ * spend a token on them). Each returned row carries a `.freshness` annotation.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{now?:number, limit?:number}} [opts]
+ * @returns {Array<object>}
+ */
+export function listReady(db, { now = Date.now(), limit = Infinity } = {}) {
+  const placeholders = DRAINABLE_STATES.map(() => '?').join(', ');
+  const rows = db.prepare(`SELECT * FROM jobs WHERE queue_status IN (${placeholders})`).all(...DRAINABLE_STATES);
+  return rows
+    .map((r) => ({ r, f: classifyFreshness({ postedAt: r.posted_at, confidence: r.posted_at_confidence, now }) }))
+    .filter((x) => x.f.sendable)
+    .sort((a, b) => a.f.priority - b.f.priority || (a.f.ageDays ?? 0) - (b.f.ageDays ?? 0))
+    .slice(0, limit)
+    .map((x) => ({ ...x.r, freshness: x.f }));
+}
+
+/**
+ * Every canonical URL in the queue — so scan.mjs's loadSeenUrls() can treat the
+ * DB as a dedup source once pipeline.md becomes a rendered view.
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {string[]}
+ */
+export function allUrls(db) {
+  return db.prepare('SELECT canonical_url FROM jobs').all().map((r) => r.canonical_url);
+}
+
+// ── URL canonicalization (the dedup key) ────────────────────────────────────
+//
+// The job's identity lives in the PATH for every ATS we scan (Greenhouse
+// /jobs/{id}, Lever/Ashby /{uuid}, Workday /job/.../{title}_{reqId}), so the
+// safe move is to strip a denylist of pure-tracking query params and PRESERVE
+// everything else. Dropping the whole query would collapse a Greenhouse embed
+// (?gh_jid=N is the job identity) — a collision, which loses a distinct job and
+// is strictly worse than leaving a duplicate. The host is lowercased (DNS is
+// case-insensitive); the path is NOT (company slugs and job ids are
+// case-sensitive).
+//
+// The denylist holds ONLY unambiguous marketing/analytics params. Generic names
+// (source, src, ref, id, from…) are deliberately NOT stripped: the queue also
+// ingests arbitrary direct-site URLs (scan-direct-sites.mjs), where such a param
+// could BE the job identity — stripping it would collide two distinct jobs
+// (data loss). A stray tracking dupe is the acceptable lesser evil.
+const TRACKING_PARAMS = new Set([
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+  'gh_src', 'gclid', 'fbclid', 'msclkid', 'mc_cid', 'mc_eid',
+  'lever-origin', 'lever-source', 'ashby_source',
+]);
+
+/**
+ * Canonicalize a job URL into a stable dedup key.
+ * Never throws: unparseable / non-http input returns the trimmed original.
+ * @param {unknown} raw
+ * @returns {string}
+ */
+export function canonicalizeUrl(raw) {
+  if (raw == null) return '';
+  const s = String(raw).trim();
+  if (!s) return '';
+  let u;
+  try { u = new URL(s); } catch { return s; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return s;
+
+  u.protocol = 'https:';                 // http/https address the same resource
+  u.hostname = u.hostname.toLowerCase(); // host is case-insensitive; path is NOT
+  u.hash = '';                           // fragments never identify a posting
+  if (u.port === '80' || u.port === '443') u.port = '';
+
+  // Keep every non-tracking param; sort for a stable key regardless of order.
+  const kept = [];
+  for (const [k, v] of u.searchParams) {
+    if (!TRACKING_PARAMS.has(k.toLowerCase())) kept.push([k, v]);
+  }
+  kept.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)));
+  u.search = '';
+  for (const [k, v] of kept) u.searchParams.append(k, v);
+
+  // Strip a single trailing slash from a non-root path ("/a/b/" → "/a/b").
+  if (u.pathname !== '/' && u.pathname.endsWith('/')) u.pathname = u.pathname.replace(/\/+$/, '');
+
+  return u.toString();
+}

@@ -158,6 +158,7 @@ const SYSTEM_PATHS = [
   'scan-workday-targeted.mjs',
   'scan-direct-sites.mjs',
   'freshness.mjs',
+  'queue.mjs',
   'everify-check.mjs',
   'adaptive-limiter.mjs',
   'capexempt-live.mjs',
