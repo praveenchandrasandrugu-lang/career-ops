@@ -46,6 +46,7 @@ import yaml from 'js-yaml';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
+import { pathToFileURL } from 'url';
 
 const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
 const DATASET = 'https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data/workday_companies.json';
@@ -105,7 +106,7 @@ function parseTenant(line) {
  * cutoff and slip through as fresh. Returns {at, exact} so the caller can treat
  * a bound differently from a real age.
  */
-function postedAtFrom(posted) {
+export function postedAtFrom(posted) {
   if (!posted) return null;
   const s = String(posted).toLowerCase();
   const mk = (days, exact) => ({ at: Date.now() - days * 86_400_000, exact, days });
@@ -118,7 +119,37 @@ function postedAtFrom(posted) {
   return null;
 }
 
-async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats) {
+/**
+ * Classify a fetch failure so the scanner can both REACT and REPORT.
+ *
+ * Motivated by the 2026-07-20 finding that "Fetch errors: 156" was really two
+ * dead tenants (422/404) queried once per keyword — invisible because every
+ * failure was collapsed into one opaque counter. The gone-vs-suspect split is
+ * a code-review refinement: only 404/410 PROVE the endpoint is gone (the URL
+ * path is invalid regardless of the request body), so only those may abort a
+ * tenant on the first hit. A 400/403/422 can be produced by one odd searchText
+ * on an otherwise-live board, so it may only abort after several in a row.
+ *
+ *   gone      404/410 — endpoint provably invalid; abort the tenant immediately.
+ *   suspect   400/403/422 — dead board OR one bad keyword; abort only after N
+ *             consecutive (see scanTenant).
+ *   throttled 429 — rate limited; per-keyword, keep going.
+ *   transient 5xx / no status (network, timeout, abort) — retryable, per-keyword.
+ *   other     anything else — recorded, not acted on.
+ *
+ * @param {{status?: number}} err
+ * @returns {{kind: 'gone'|'suspect'|'throttled'|'transient'|'other', status: number|null}}
+ */
+export function classifyFetchError(err) {
+  const status = typeof err?.status === 'number' ? err.status : null;
+  if (status === 429) return { kind: 'throttled', status };
+  if (status === null || status >= 500) return { kind: 'transient', status };
+  if (status === 404 || status === 410) return { kind: 'gone', status };
+  if (status === 400 || status === 403 || status === 422) return { kind: 'suspect', status };
+  return { kind: 'other', status };
+}
+
+export async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats) {
   let offset = 0;
   let total = null;
   let lastSig = null;
@@ -132,8 +163,15 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
       });
     } catch (err) {
       if (err.circuitOpen) throw err;
-      stats.errors++;
-      return;
+      // Throw a CLASSIFIED failure and let scanTenant do the accounting and the
+      // gone/suspect abort logic in one place. Any partial-page results already
+      // pushed to `out` are kept; the keyword itself is marked failed (not
+      // silently counted as "completed"), which fixes the coverage overcount.
+      const c = classifyFetchError(err);
+      const e = new Error(`${t.tenant}/"${keyword}" ${c.kind} (${c.status ?? 'network'})`);
+      e.fetchKind = c.kind;
+      e.status = c.status;
+      throw e;
     }
     if (total === null) {
       total = json.total ?? 0;
@@ -182,7 +220,63 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
   }
 }
 
-(async () => {
+/**
+ * Scan one tenant across all keywords, with dead-board handling.
+ *
+ * `gone` (404/410) aborts the tenant on the first hit — the endpoint is
+ * provably invalid, so every keyword would fail identically. `suspect`
+ * (400/403/422) is ambiguous (a dead board OR one odd searchText), so it aborts
+ * only after `suspectAbortThreshold` CONSECUTIVE hits: a truly dead board still
+ * stops after a few requests, but one bad keyword can't false-abort a live
+ * tenant. throttled/transient/other are per-keyword coverage holes — recorded,
+ * counted as skipped (never as completed), never aborting.
+ */
+export async function scanTenant(ctx, t, keywords, cutoff, sinceDays, out, seen, stats, { suspectAbortThreshold = 3 } = {}) {
+  const record = (status) => {
+    const bucket = status == null ? 'network' : String(status);
+    stats.errorsByStatus[bucket] = (stats.errorsByStatus[bucket] || 0) + 1;
+    stats.errors++;
+  };
+  let consecutiveSuspect = 0;
+  for (const kw of keywords) {
+    try {
+      await queryKeyword(ctx, t, kw, cutoff, sinceDays, out, seen, stats);
+      stats.completed++;
+      consecutiveSuspect = 0;
+    } catch (err) {
+      if (err.circuitOpen) {
+        // Whole ATS family is cooling down — record the hole, wait, keep going.
+        stats.skipped.push(`${t.tenant}/"${kw}"`);
+        console.error(`⚠️  circuit open on ${t.tenant} — cooling down`);
+        await sleep(5000);
+        consecutiveSuspect = 0;
+        continue;
+      }
+      record(err.status);
+      if (err.fetchKind === 'gone') {
+        // The keyword that hit the dead board FAILED — count it as a coverage
+        // hole too, so the skipped tally never understates (consistent with the
+        // suspect path). The dead-tenant note explains why re-running won't help.
+        stats.skipped.push(`${t.tenant}/"${kw}"`);
+        stats.deadTenants.push(`${t.tenant} (${err.status} gone)`);
+        return;
+      }
+      if (err.fetchKind === 'suspect') {
+        stats.skipped.push(`${t.tenant}/"${kw}"`);
+        if (++consecutiveSuspect >= suspectAbortThreshold) {
+          stats.deadTenants.push(`${t.tenant} (${err.status} ×${consecutiveSuspect})`);
+          return;
+        }
+        continue;
+      }
+      // throttled / transient / other → per-keyword coverage hole, keep going.
+      stats.skipped.push(`${t.tenant}/"${kw}"`);
+      consecutiveSuspect = 0;
+    }
+  }
+}
+
+export async function main() {
   const sinceDays = Number(opt('--since', '30'));
   const limit = Number(opt('--limit', '50'));
   const cutoff = Date.now() - sinceDays * 86_400_000;
@@ -216,22 +310,13 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
   // so a dry run cannot surface the break.
   const seen = dry ? new Set() : loadSeenUrls().seen;
   const out = [];
-  const stats = { errors: 0, undated: 0, boundedStale: 0, repeatedPage: 0, stillCapped: [], tenantsDone: 0, skipped: [] };
+  const stats = { errors: 0, completed: 0, undated: 0, boundedStale: 0, repeatedPage: 0, stillCapped: [], tenantsDone: 0, skipped: [], errorsByStatus: {}, deadTenants: [] };
   const totalQueries = tenants.length * KEYWORDS.length;
-  let queriesDone = 0;
 
   for (const t of tenants) {
-    for (const kw of KEYWORDS) {
-      try {
-        await queryKeyword(ctx, t, kw, cutoff, sinceDays, out, seen, stats);
-        queriesDone++;
-      } catch (err) {
-        // A skipped query is a COVERAGE HOLE, not a non-event. Record it so the
-        // summary can never imply the scan was complete when it wasn't.
-        stats.skipped.push(`${t.tenant}/"${kw}"`);
-        if (err.circuitOpen) { console.error(`⚠️  circuit open on ${t.tenant} — cooling down`); await sleep(5000); }
-      }
-    }
+    // scanTenant owns the per-keyword loop, error accounting, and the
+    // gone/suspect dead-board abort logic (kept in one testable place).
+    await scanTenant(ctx, t, KEYWORDS, cutoff, sinceDays, out, seen, stats);
     if (++stats.tenantsDone % 10 === 0) console.log(`  ${stats.tenantsDone}/${tenants.length} tenants, ${out.length} matches`);
   }
 
@@ -241,14 +326,27 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
   console.log(`Tenants:          ${tenants.length}`);
   // Report completed queries against attempted, never just the plan — a run
   // that skipped queries must not read as full coverage.
-  console.log(`Queries:          ${queriesDone}/${totalQueries} completed${stats.skipped.length ? ` (${stats.skipped.length} SKIPPED — coverage incomplete)` : ''}`);
+  console.log(`Queries:          ${stats.completed}/${totalQueries} completed${stats.skipped.length ? ` (${stats.skipped.length} SKIPPED — coverage incomplete)` : ''}`);
   console.log(`Undated dropped:  ${stats.undated}`);
   console.log(`Stale ("N+ days" past cutoff): ${stats.boundedStale}`);
-  console.log(`Fetch errors:     ${stats.errors}`);
+  // Break the error count down by HTTP status so a dead-tenant pileup (422/404)
+  // is never mistaken for rate limiting (429) or a network blip — the whole
+  // point of the 2026-07-20 fix. Sorted by frequency, biggest cause first.
+  const errBreakdown = Object.entries(stats.errorsByStatus)
+    .sort((a, b) => b[1] - a[1])
+    .map(([s, n]) => `${n}×${s}`)
+    .join(', ');
+  console.log(`Fetch errors:     ${stats.errors}${errBreakdown ? ` (${errBreakdown})` : ''}`);
   console.log(`New matches:      ${out.length}`);
 
+  if (stats.deadTenants.length) {
+    console.log(`\n⚠️  ${stats.deadTenants.length} dead tenant(s) skipped (board returned 4xx — remaining keywords NOT queried):`);
+    for (const d of stats.deadTenants.slice(0, 12)) console.log(`     ${d}`);
+    if (stats.deadTenants.length > 12) console.log(`     ...and ${stats.deadTenants.length - 12} more`);
+  }
+
   if (stats.skipped.length) {
-    console.log(`\n⚠️  ${stats.skipped.length} quer${stats.skipped.length === 1 ? 'y' : 'ies'} skipped (rate limiting) — these employers/keywords were NOT searched:`);
+    console.log(`\n⚠️  ${stats.skipped.length} quer${stats.skipped.length === 1 ? 'y' : 'ies'} skipped (fetch errors / rate limiting — see the status breakdown above) — these employers/keywords were NOT searched:`);
     for (const s of stats.skipped.slice(0, 12)) console.log(`     ${s}`);
     if (stats.skipped.length > 12) console.log(`     ...and ${stats.skipped.length - 12} more`);
     console.log(`     Re-run to cover them.`);
@@ -290,4 +388,6 @@ async function queryKeyword(ctx, t, keyword, cutoff, sinceDays, out, seen, stats
   } else if (dry) {
     console.log('\n(dry run — nothing written)');
   }
-})();
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) main();

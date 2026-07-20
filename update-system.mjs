@@ -241,6 +241,7 @@ const SYSTEM_PATHS = [
   'writing-samples/README.md',
   'VERSION',
   'DATA_CONTRACT.md',
+  'FIND-JOBS.md',
   'MANIFESTO.md',
   'manifesto.mjs',
   'SIGNATURES.md',
