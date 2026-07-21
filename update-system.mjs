@@ -159,6 +159,7 @@ const SYSTEM_PATHS = [
   'scan-direct-sites.mjs',
   'freshness.mjs',
   'queue.mjs',
+  'queue-migrate.mjs',
   'everify-check.mjs',
   'adaptive-limiter.mjs',
   'capexempt-live.mjs',

@@ -2,6 +2,9 @@
 cv.md
 data/applications.md
 data/applications.db
+data/queue.db
+data/queue.db-wal
+data/queue.db-shm
 data/follow-ups.md
 data/salary-observations.tsv
 data/pipeline.md

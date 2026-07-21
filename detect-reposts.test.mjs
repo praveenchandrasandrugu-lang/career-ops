@@ -816,9 +816,17 @@ console.log('\n--- 12. CLI behavior ---');
 
 const scriptPath = join(dirname(fileURLToPath(import.meta.url)), 'detect-reposts.mjs');
 
+// These CLI runs read the REAL data/scan-history.tsv, so the JSON payload grows
+// with the user's scan history — it is not a fixed fixture. Node's default
+// maxBuffer is 1 MiB, which a normal history now exceeds (a 9.3k-row history
+// emits ~1.1 MB and the run dies with ENOBUFS). Because scan-history.tsv is
+// gitignored user data, CI on a clean checkout never hits this and the failure
+// only ever appears on a real workspace. Raise the ceiling explicitly.
+const CLI_OPTS = { encoding: 'utf-8', timeout: 10000, maxBuffer: 64 * 1024 * 1024, cwd: dirname(scriptPath) };
+
 // Test --self-test exit code
 try {
-  execFileSync('node', [scriptPath, '--self-test'], { encoding: 'utf-8', timeout: 10000 });
+  execFileSync('node', [scriptPath, '--self-test'], CLI_OPTS);
   ok('--self-test exits 0', true);
 } catch (e) {
   ok('--self-test exits 0', false);
@@ -826,26 +834,17 @@ try {
 }
 
 // Test --window flag
-const windowOut = execFileSync('node', [scriptPath, '--window', '30'], {
-  encoding: 'utf-8', timeout: 10000,
-  cwd: dirname(scriptPath),
-});
+const windowOut = execFileSync('node', [scriptPath, '--window', '30'], CLI_OPTS);
 const windowJson = JSON.parse(windowOut);
 ok('--window produces valid JSON output', typeof windowJson === 'object' && 'metadata' in windowJson);
 eq('--window sets windowDays in metadata', windowJson.metadata.windowDays, 30);
 
 // Test --summary flag
-const summaryOut = execFileSync('node', [scriptPath, '--summary'], {
-  encoding: 'utf-8', timeout: 10000,
-  cwd: dirname(scriptPath),
-});
+const summaryOut = execFileSync('node', [scriptPath, '--summary'], CLI_OPTS);
 ok('--summary produces human-readable output', summaryOut.includes('Repost Detector'));
 
 // Test no args (default JSON output)
-const defaultOut = execFileSync('node', [scriptPath], {
-  encoding: 'utf-8', timeout: 10000,
-  cwd: dirname(scriptPath),
-});
+const defaultOut = execFileSync('node', [scriptPath], CLI_OPTS);
 const defaultJson = JSON.parse(defaultOut);
 ok('default produces valid JSON', typeof defaultJson === 'object');
 ok('default has metadata', 'metadata' in defaultJson);
@@ -853,18 +852,12 @@ ok('default has clusters array', 'clusters' in defaultJson && Array.isArray(defa
 eq('default windowDays = 90', defaultJson.metadata.windowDays, 90);
 
 // Test --window with non-numeric value (falls back to default)
-const badWindowOut = execFileSync('node', [scriptPath, '--window', 'abc'], {
-  encoding: 'utf-8', timeout: 10000,
-  cwd: dirname(scriptPath),
-});
+const badWindowOut = execFileSync('node', [scriptPath, '--window', 'abc'], CLI_OPTS);
 const badWindowJson = JSON.parse(badWindowOut);
 eq('--window abc falls back to 90', badWindowJson.metadata.windowDays, 90);
 
 // Test --window with no value (falls back to default)
-const noWindowOut = execFileSync('node', [scriptPath, '--window'], {
-  encoding: 'utf-8', timeout: 10000,
-  cwd: dirname(scriptPath),
-});
+const noWindowOut = execFileSync('node', [scriptPath, '--window'], CLI_OPTS);
 const noWindowJson = JSON.parse(noWindowOut);
 eq('--window without value falls back to 90', noWindowJson.metadata.windowDays, 90);
 

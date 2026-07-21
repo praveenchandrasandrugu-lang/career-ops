@@ -610,6 +610,12 @@ export function loadSeenUrls(policy = {}) {
  * a no-op. A corrupt/locked queue is swallowed so it can never abort a scan;
  * dedup just falls back to the file sources already loaded.
  *
+ * Every queue row is deduped unconditionally, which is correct because the queue
+ * only ever holds rows that came from a real posting listing. scan-history.tsv
+ * is deliberately NOT migrated into it (see queue-migrate.mjs): that file's
+ * `recheck_after_days` / `cooldown:` policy is applied in loadSeenUrls above,
+ * against the file itself, where the row's original status and date still exist.
+ *
  * @param {Set<string>} seen  A CanonicalUrlSet (add() canonicalizes); a plain Set
  *   also works since allUrls() returns already-canonical keys.
  * @param {{dbPath?: string}} [opts]

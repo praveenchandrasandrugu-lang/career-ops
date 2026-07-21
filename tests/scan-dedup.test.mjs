@@ -88,6 +88,7 @@ async function main() {
     withDb.has('https://queued.example.com/jobs/77'));
   T('loadQueueSeenUrls: folded URL is canonicalized (tracking-param variant matches)',
     withDb.has('https://queued.example.com/jobs/77?utm_source=other'));
+
 }
 
 main()
