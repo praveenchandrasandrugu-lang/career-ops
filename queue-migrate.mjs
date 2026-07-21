@@ -129,10 +129,10 @@ export function parsePipeline(text) {
   return rows;
 }
 
-const COLUMNS = `(canonical_url, raw_url, company, title, source,
+const COLUMNS = `(canonical_url, raw_url, company, title, location, source,
     posted_at, posted_at_confidence, first_seen_at, last_seen_at,
     queue_status, skip_reason)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 // pipeline.md carries VERDICTS ("archived: Non-US", "hard-filtered"), so when it
 // disagrees with an existing row the verdict has to win — but only over `new`.
@@ -165,7 +165,7 @@ export function importRows(db, rows, { now = Date.now(), source = 'pipeline.md' 
       const canonical = canonicalizeUrl(r.url);
       if (!canonical) { malformed++; continue; }
       if (exists.get(canonical)) existing++; else inserted++;
-      insert.run(canonical, r.url, r.company ?? '', r.title ?? '', source,
+      insert.run(canonical, r.url, r.company ?? '', r.title ?? '', r.location ?? '', source,
         r.postedAt ?? null, r.confidence ?? 'unknown', now, now,
         r.queueStatus, r.skipReason ?? null);
     }

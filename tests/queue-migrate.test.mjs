@@ -139,6 +139,9 @@ async function dbTests() {
     eq('importRows: archived row is skipped', row('jobs/3').queue_status, 'skipped');
     eq('importRows: archived row keeps its reason', row('jobs/3').skip_reason, 'archived: Non-US');
     eq('importRows: date imported as epoch', row('jobs/1').posted_at, Date.UTC(2026, 6, 20));
+    // location is what the US/non-US gate reads; parsing it and then dropping it
+    // would leave that gate with nothing to judge on.
+    eq('importRows: location imported', row('jobs/1').location, 'Austin TX');
     eq('importRows: confidence imported', row('jobs/1').posted_at_confidence, 'exact');
     db.close();
   }

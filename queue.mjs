@@ -58,6 +58,14 @@ const QUEUE_STATES = sqlEnum(['new', 'llm_ready', 'in_progress', 'evaluated', 's
 // moves `new` → `llm_ready` or `skipped`.
 const DRAINABLE_STATES = ['llm_ready'];
 
+/** Add any declared column the `jobs` table does not already have. */
+function addMissingColumns(db, columns) {
+  const have = new Set(db.prepare('PRAGMA table_info(jobs)').all().map((c) => c.name));
+  for (const [name, decl] of Object.entries(columns)) {
+    if (!have.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${decl}`);
+  }
+}
+
 /**
  * Open (and create/migrate) the job-queue database.
  * @param {string} path  file path, or ':memory:' for tests
@@ -78,6 +86,7 @@ export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/
       provider_job_id        TEXT,
       company                TEXT NOT NULL DEFAULT '',
       title                  TEXT NOT NULL DEFAULT '',
+      location               TEXT NOT NULL DEFAULT '',
       source                 TEXT NOT NULL DEFAULT '',
       posted_at              INTEGER,
       posted_at_confidence   TEXT NOT NULL DEFAULT 'unknown' CHECK(posted_at_confidence IN ${CONFIDENCES}),
@@ -96,6 +105,10 @@ export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/
     CREATE INDEX IF NOT EXISTS idx_jobs_queue_status ON jobs(queue_status);
     CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON jobs(posted_at);
   `);
+  // CREATE TABLE IF NOT EXISTS silently skips an EXISTING table, so a column
+  // added after a DB was first created has to be ALTERed in. Additive-only, so
+  // it is safe to run on every open and needs no version bookkeeping.
+  addMissingColumns(db, { location: "TEXT NOT NULL DEFAULT ''" });
   return db;
 }
 
@@ -115,9 +128,9 @@ export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/
 export function upsertJobs(db, offers, { now = Date.now() } = {}) {
   const exists = db.prepare('SELECT 1 FROM jobs WHERE canonical_url = ?');
   const insert = db.prepare(`
-    INSERT INTO jobs (canonical_url, raw_url, provider_job_id, company, title, source,
+    INSERT INTO jobs (canonical_url, raw_url, provider_job_id, company, title, location, source,
       posted_at, posted_at_confidence, first_seen_at, last_seen_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   // On update, a date is overwritten ONLY when the incoming one is usable AND at
   // least as trustworthy as what is stored — so a re-scan that lost the date
   // (Workday sometimes drops postedOn) or only carries a weaker "30+ days" lower
@@ -127,7 +140,7 @@ export function upsertJobs(db, offers, { now = Date.now() } = {}) {
   const RANK_SQL = "(CASE posted_at_confidence WHEN 'exact' THEN 3 WHEN 'relative_exact' THEN 3 WHEN 'lower_bound' THEN 2 ELSE 1 END)";
   const update = db.prepare(`
     UPDATE jobs SET raw_url = ?, provider_job_id = COALESCE(?, provider_job_id),
-      company = ?, title = ?, source = ?,
+      company = ?, title = ?, location = ?, source = ?,
       posted_at            = CASE WHEN ? >= ${RANK_SQL} THEN ? ELSE posted_at            END,
       posted_at_confidence = CASE WHEN ? >= ${RANK_SQL} THEN ? ELSE posted_at_confidence END,
       last_seen_at = ? WHERE canonical_url = ?`);
@@ -151,11 +164,11 @@ export function upsertJobs(db, offers, { now = Date.now() } = {}) {
       const postedAt = conf === 'unknown' ? null : o.postedAt;
       const inRank = confRank(conf);
       if (exists.get(canonical)) {
-        update.run(o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.source ?? '',
+        update.run(o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.location ?? '', o.source ?? '',
           inRank, postedAt, inRank, conf, now, canonical);
         updated++;
       } else {
-        insert.run(canonical, o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.source ?? '',
+        insert.run(canonical, o.url, o.providerJobId ?? null, o.company ?? '', o.title ?? '', o.location ?? '', o.source ?? '',
           postedAt, conf, now, now);
         inserted++;
       }
