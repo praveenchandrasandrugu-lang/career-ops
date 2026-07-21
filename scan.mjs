@@ -44,6 +44,7 @@ import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { normalizeCompany } from './tracker-utils.mjs';
+import { canonicalizeUrl, openQueue, allUrls } from './queue.mjs';
 
 try {
   const { config } = await import('dotenv');
@@ -551,8 +552,22 @@ function scanHistoryPolicy(config = {}) {
   };
 }
 
+/**
+ * A Set of URLs that dedups on the CANONICAL form (queue.mjs's canonicalizeUrl,
+ * the shared dedup key) instead of exact string equality. Overriding add and has
+ * means every dedup consumer — scan.mjs, scan-ats-full.mjs, the Workday-targeted
+ * and direct-site scanners — normalizes on BOTH sides for free, so a cosmetic URL
+ * variant (a ?language=en locale suffix, a utm_* param, a trailing slash) can no
+ * longer re-emit an already-seen posting (#2065). Extending Set keeps it a
+ * drop-in for every existing `.has()`/`.add()` site and for `instanceof Set`.
+ */
+export class CanonicalUrlSet extends Set {
+  add(url) { return super.add(canonicalizeUrl(url)); }
+  has(url) { return super.has(canonicalizeUrl(url)); }
+}
+
 export function loadSeenUrls(policy = {}) {
-  const seen = new Set();
+  const seen = new CanonicalUrlSet();
   let recheckEligible = 0;
 
   // scan-history.tsv
@@ -583,6 +598,39 @@ export function loadSeenUrls(policy = {}) {
   }
 
   return { seen, recheckEligible };
+}
+
+/**
+ * Fold the SQLite job queue (queue.mjs) into a seen-URL set as an additional
+ * dedup source, so a posting already discovered by a queue-writing scanner is
+ * not re-emitted. Every canonical_url the queue holds is added to `seen`.
+ *
+ * Guarded on existence: openQueue() would CREATE an empty DB as a side effect on
+ * a missing path, and a read-only dedup load must never do that — an absent DB is
+ * a no-op. A corrupt/locked queue is swallowed so it can never abort a scan;
+ * dedup just falls back to the file sources already loaded.
+ *
+ * @param {Set<string>} seen  A CanonicalUrlSet (add() canonicalizes); a plain Set
+ *   also works since allUrls() returns already-canonical keys.
+ * @param {{dbPath?: string}} [opts]
+ * @returns {Promise<Set<string>>} the same `seen`, for chaining.
+ */
+export async function loadQueueSeenUrls(seen, { dbPath = process.env.CAREER_OPS_QUEUE_DB || 'data/queue.db' } = {}) {
+  if (!existsSync(dbPath)) return seen;
+  // openQueue() calls process.exit(1) when node:sqlite is missing (Node < 22.5) —
+  // a try/catch cannot intercept that, so probe the module first and bail out
+  // quietly. Dedup is an optimization here; it must never end the scan.
+  try { await import('node:sqlite'); } catch { return seen; }
+  let db;
+  try {
+    db = await openQueue(dbPath);
+    for (const url of allUrls(db)) seen.add(url);
+  } catch {
+    // A corrupt/locked queue must never take down a scan.
+  } finally {
+    try { db?.close(); } catch { /* already closed */ }
+  }
+  return seen;
 }
 
 /**
@@ -1415,6 +1463,7 @@ async function main() {
   const historyPolicy = scanHistoryPolicy(config);
   const seenUrlState = loadSeenUrls(historyPolicy);
   const seenUrls = seenUrlState.seen;
+  await loadQueueSeenUrls(seenUrls); // fold the SQLite queue in (no-op until it exists)
   const canonicalizeCompany = buildCompanyCanonicalizer(config.company_aliases);
   const seenCompanyRoles = loadSeenCompanyRoles(APPLICATIONS_PATH, canonicalizeCompany);
 

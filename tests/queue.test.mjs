@@ -61,6 +61,39 @@ eq('canonicalizeUrl: sorts remaining params for a stable key',
   canonicalizeUrl('https://boards.greenhouse.io/embed/job_app?gh_jid=42&for=acme'),
   'https://boards.greenhouse.io/embed/job_app?for=acme&gh_jid=42');
 
+// ── locale suffixes are display-only, never job identity (#2065) ─────────────
+// A personio posting served as ?language=en and the bare canonical form are the
+// same job; a locale param must not defeat dedup.
+eq('canonicalizeUrl: strips ?language= locale suffix (#2065 personio case)',
+  canonicalizeUrl('https://acme.jobs.personio.com/job/2670127?language=en'),
+  'https://acme.jobs.personio.com/job/2670127');
+eq('canonicalizeUrl: strips ?lang= locale suffix',
+  canonicalizeUrl('https://careers.example.com/jobs/123?lang=de'),
+  'https://careers.example.com/jobs/123');
+eq('canonicalizeUrl: strips ?locale= suffix',
+  canonicalizeUrl('https://careers.example.com/jobs/123?locale=fr_FR'),
+  'https://careers.example.com/jobs/123');
+T('canonicalizeUrl: same job in two display languages dedups equal (#2065)',
+  canonicalizeUrl('https://acme.jobs.personio.com/job/2670127?language=en')
+  === canonicalizeUrl('https://acme.jobs.personio.com/job/2670127?language=de'));
+eq('canonicalizeUrl: strips locale alongside a preserved id param',
+  canonicalizeUrl('https://careers.costco.com/jobs/28927?lang=en-us'),
+  'https://careers.costco.com/jobs/28927');
+eq('canonicalizeUrl: strips a subtagged locale (zh-Hans)',
+  canonicalizeUrl('https://careers.example.com/jobs/123?locale=zh-Hans'),
+  'https://careers.example.com/jobs/123');
+
+// Collision safety: a locale-NAMED param carrying a non-locale VALUE is real
+// data (a ?lang=java skills filter), not a display language. Stripping it would
+// collapse two distinct postings — the one failure mode this canonicalizer
+// refuses to risk. Only locale-SHAPED values (en, en-us, fr_FR) are dropped.
+eq('canonicalizeUrl: PRESERVES ?lang= when the value is not locale-shaped (?lang=java)',
+  canonicalizeUrl('https://careers.example.com/jobs?lang=java'),
+  'https://careers.example.com/jobs?lang=java');
+T('canonicalizeUrl: ?lang=java and ?lang=python stay distinct (no collision)',
+  canonicalizeUrl('https://careers.example.com/jobs?lang=java')
+  !== canonicalizeUrl('https://careers.example.com/jobs?lang=python'));
+
 // ── collision safety: distinct jobs must NEVER collapse ─────────────────────
 T('canonicalizeUrl: two different gh_jid stay distinct (no collision)',
   canonicalizeUrl('https://boards.greenhouse.io/embed/job_app?for=acme&gh_jid=1')

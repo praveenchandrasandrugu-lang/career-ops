@@ -221,6 +221,25 @@ const TRACKING_PARAMS = new Set([
   'lever-origin', 'lever-source', 'ashby_source',
 ]);
 
+// Locale/display-language suffixes (#2065). The same posting served as
+// ?language=en and ?language=de is one job in two display languages, so leaving
+// these in defeats dedup (a personio scan re-emitted 11 already-processed roles).
+//
+// But these param NAMES are not reserved: `?lang=java` on a careers page is a
+// skills filter — real, identifying data. Stripping it would collapse two
+// distinct postings, the one failure mode this canonicalizer refuses to risk.
+// So the strip is gated on the VALUE being locale-SHAPED: a 2-3 letter language
+// subtag with optional script/region subtags (en, en-us, fr_FR, pt-BR, zh-Hans).
+// "java"/"python" do not match and are preserved.
+const LOCALE_PARAMS = new Set(['language', 'lang', 'locale']);
+const LOCALE_VALUE = /^[a-z]{2,3}(?:[-_][a-z0-9]{2,8})*$/i;
+
+const isDroppableParam = (key, value) => {
+  const k = key.toLowerCase();
+  if (TRACKING_PARAMS.has(k)) return true;
+  return LOCALE_PARAMS.has(k) && LOCALE_VALUE.test(value);
+};
+
 /**
  * Canonicalize a job URL into a stable dedup key.
  * Never throws: unparseable / non-http input returns the trimmed original.
@@ -243,7 +262,7 @@ export function canonicalizeUrl(raw) {
   // Keep every non-tracking param; sort for a stable key regardless of order.
   const kept = [];
   for (const [k, v] of u.searchParams) {
-    if (!TRACKING_PARAMS.has(k.toLowerCase())) kept.push([k, v]);
+    if (!isDroppableParam(k, v)) kept.push([k, v]);
   }
   kept.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)));
   u.search = '';

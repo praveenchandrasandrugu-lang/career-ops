@@ -32,7 +32,7 @@
  */
 import { readFileSync, existsSync } from 'fs';
 import yaml from 'js-yaml';
-import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
+import { buildTitleFilter, buildLocationFilter, loadSeenUrls, loadQueueSeenUrls, CanonicalUrlSet, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
 import { makeHttpCtx, BROWSER_LIKE_USER_AGENT } from './providers/_http.mjs';
 
@@ -175,7 +175,9 @@ function normalize(p, pageUrl, company) {
   // loadSeenUrls() returns { seen, recheckEligible } — unwrap it. Taking the
   // object directly makes seen.has() a TypeError, and only on non-dry runs,
   // so a dry run cannot surface the break.
-  const seen = dry ? new Set() : loadSeenUrls().seen;
+  // CanonicalUrlSet even when dry: a dry preview should dedup exactly like a real
+  // run, including cosmetic URL variants of the same posting within one scan.
+  const seen = dry ? new CanonicalUrlSet() : await loadQueueSeenUrls(loadSeenUrls().seen);
   const out = [];
   const noStructured = [];
   const pageSeen = new Set();

@@ -43,7 +43,7 @@
  */
 import { readFileSync, existsSync, mkdirSync, writeFileSync, statSync } from 'fs';
 import yaml from 'js-yaml';
-import { buildTitleFilter, buildLocationFilter, loadSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
+import { buildTitleFilter, buildLocationFilter, loadSeenUrls, loadQueueSeenUrls, CanonicalUrlSet, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
 import { pathToFileURL } from 'url';
@@ -308,7 +308,9 @@ export async function main() {
   // loadSeenUrls() returns { seen, recheckEligible } — unwrap it. Taking the
   // object directly makes seen.has() a TypeError, and only on non-dry runs,
   // so a dry run cannot surface the break.
-  const seen = dry ? new Set() : loadSeenUrls().seen;
+  // CanonicalUrlSet even when dry: a dry preview should dedup exactly like a real
+  // run, including cosmetic URL variants of the same posting within one scan.
+  const seen = dry ? new CanonicalUrlSet() : await loadQueueSeenUrls(loadSeenUrls().seen);
   const out = [];
   const stats = { errors: 0, completed: 0, undated: 0, boundedStale: 0, repeatedPage: 0, stillCapped: [], tenantsDone: 0, skipped: [], errorsByStatus: {}, deadTenants: [] };
   const totalQueries = tenants.length * KEYWORDS.length;
