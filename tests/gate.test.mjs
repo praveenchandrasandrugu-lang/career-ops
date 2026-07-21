@@ -16,7 +16,7 @@
  * Run: node tests/gate.test.mjs  (or via test-all.mjs)
  */
 import { pass, fail } from './helpers.mjs';
-import { openQueue, upsertJobs } from '../queue.mjs';
+import { openQueue, upsertJobs, listReady } from '../queue.mjs';
 import { classifyLocation, classifyLevel, runGate } from '../gate.mjs';
 
 const T = (label, cond) => (cond ? pass(label) : fail(label, 'assertion failed'));
@@ -37,10 +37,10 @@ eq('classifyLocation: full state name', classifyLocation('Minneapolis, Minnesota
 // Two-letter state codes must be matched CASE-SENSITIVELY. Found by sampling
 // real output: a case-insensitive match reads the Spanish "de" as Delaware and
 // the English "in" as Indiana, so
-// "Las Condes, Santiago,, Region Metropolitana de Santiago, Chile" was
-// classified US. Real postings write state codes uppercase, so nothing is lost.
+// "Las Condes, Region Metropolitana de Valparaiso, Chile" was classified US.
+// Real postings write state codes uppercase, so nothing is lost.
 eq('classifyLocation: Spanish "de" is not Delaware',
-  classifyLocation('Las Condes, Santiago,, Region Metropolitana de Santiago, Chile'), 'non_us');
+  classifyLocation('Las Condes, Region Metropolitana de Valparaiso, Chile'), 'non_us');
 eq('classifyLocation: "in" is not Indiana',
   classifyLocation('Working in Berlin, Germany'), 'non_us');
 
@@ -52,6 +52,10 @@ eq('classifyLocation: foreign city with a diacritic', classifyLocation('Köln'),
 eq('classifyLocation: Hyderabad', classifyLocation('Hyderabad'), 'non_us');
 eq('classifyLocation: Pune with a site suffix', classifyLocation('Pune, Gera Commerzone SEZ'), 'non_us');
 eq('classifyLocation: UK', classifyLocation('UK'), 'non_us');
+// Canada is the likeliest non-US leak for a US-targeted search, so its major
+// cities are covered by name (spotted in real drain output: "Calgary").
+eq('classifyLocation: Calgary', classifyLocation('Calgary'), 'non_us');
+eq('classifyLocation: Edmonton', classifyLocation('Edmonton'), 'non_us');
 
 // An explicit country beats an ambiguous city name: San Jose exists in both
 // California and Costa Rica, so the country decides. (San Jose is deliberately
@@ -244,6 +248,42 @@ async function gateTests() {
     runGate(db, { now: NOW });
     eq('upsertJobs: persists location so the gate can judge it',
       statusOf(db, 13).skip_reason, 'non-US');
+    db.close();
+  }
+
+  // E-Verify RANKS, it never skips. The USCIS export lists only enrolled
+  // employers, so a miss proves a name mismatch (brand vs legal name), not
+  // non-enrollment — skipping on it would drop workable employers.
+  {
+    const db = await seed([job({ id: 14, company: 'Walmart' }), job({ id: 15, company: 'Nonexistent Widgets' })]);
+    const lookup = new Map([
+      ['Walmart', { status: 'enrolled', employer: 'WALMART INC' }],
+      ['Nonexistent Widgets', { status: 'not_found' }],
+    ]);
+    runGate(db, { now: NOW, everify: lookup });
+    eq('runGate: an enrolled employer is promoted', statusOf(db, 14).queue_status, 'llm_ready');
+    eq('runGate: a not-found employer is ALSO promoted, never skipped',
+      statusOf(db, 15).queue_status, 'llm_ready');
+    eq('runGate: the enrolled verdict is recorded for ranking',
+      db.prepare("SELECT everify_status FROM jobs WHERE canonical_url LIKE '%jobs/14%'").get().everify_status,
+      'enrolled');
+    eq('runGate: the not-found verdict is recorded too',
+      db.prepare("SELECT everify_status FROM jobs WHERE canonical_url LIKE '%jobs/15%'").get().everify_status,
+      'not_found');
+    db.close();
+  }
+
+  // listReady must surface enrolled employers first, since that is the whole
+  // point of recording a signal we refuse to gate on.
+  {
+    const db = await seed([job({ id: 16, company: 'Unknown Co' }), job({ id: 17, company: 'Walmart' })]);
+    runGate(db, { now: NOW, everify: new Map([
+      ['Unknown Co', { status: 'not_found' }],
+      ['Walmart', { status: 'enrolled' }],
+    ]) });
+    const ready = listReady(db, { now: NOW });
+    eq('listReady: both rows are drainable', ready.length, 2);
+    eq('listReady: the E-Verify-enrolled employer comes first', ready[0].company, 'Walmart');
     db.close();
   }
 

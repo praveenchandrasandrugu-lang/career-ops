@@ -75,7 +75,8 @@ const US_CITIES = ['san francisco', 'los angeles', 'new york', 'chicago', 'bosto
   'redmond', 'bellevue', 'boulder', 'fort worth', 'san antonio', 'jacksonville', 'buffalo'];
 const FOREIGN_CITIES = ['bengaluru', 'bangalore', 'hyderabad', 'pune', 'chennai', 'mumbai',
   'new delhi', 'gurugram', 'gurgaon', 'noida', 'kolkata', 'ahmedabad', 'cairo', 'bucharest',
-  'buenos aires', 'toronto', 'vancouver', 'montreal', 'ottawa', 'prague', 'london', 'dublin',
+  'buenos aires', 'toronto', 'vancouver', 'montreal', 'ottawa', 'calgary', 'edmonton',
+  'winnipeg', 'halifax', 'mississauga', 'prague', 'london', 'dublin',
   'glasgow', 'edinburgh', 'manchester', 'birmingham', 'belfast', 'berlin', 'munich',
   'münchen', 'cologne', 'köln', 'hamburg', 'frankfurt', 'stuttgart', 'düsseldorf', 'jena',
   'paris', 'lyon', 'toulouse', 'guyancourt', 'madrid', 'barcelona', 'valencia', 'lisbon',
@@ -204,8 +205,9 @@ const GATES = [
  * @param {{now?:number, dryRun?:boolean}} [opts]
  * @returns {{considered:number, promoted:number, skipped:number, reasons:Record<string,number>}}
  */
-export function runGate(db, { now = Date.now(), dryRun = false } = {}) {
+export function runGate(db, { now = Date.now(), dryRun = false, everify = null } = {}) {
   const rows = db.prepare("SELECT * FROM jobs WHERE queue_status = 'new'").all();
+  const setEverify = db.prepare('UPDATE jobs SET everify_status = ? WHERE canonical_url = ?');
   // Promotion CLEARS skip_reason, or a promoted row reads as queued and
   // rejected at once. Both writes are guarded on queue_status = 'new' so a row
   // whose status changed between this SELECT and the UPDATE is left alone
@@ -233,6 +235,14 @@ export function runGate(db, { now = Date.now(), dryRun = false } = {}) {
       promoted++;
       writes.push(() => promote.run(level, row.canonical_url));
     }
+    // E-Verify RANKS, it never skips — recorded on every row that got this far,
+    // including skipped ones, so a later audit keeps the signal. The USCIS
+    // export lists only enrolled employers, so a miss proves a name mismatch
+    // (brand vs legal name), not that the employer cannot hire on STEM OPT.
+    if (everify) {
+      const verdict = everify.get(row.company)?.status ?? 'not_found';
+      writes.push(() => setEverify.run(verdict, row.canonical_url));
+    }
   }
 
   if (!dryRun && writes.length) {
@@ -252,7 +262,24 @@ export function runGate(db, { now = Date.now(), dryRun = false } = {}) {
 async function main() {
   const dryRun = process.argv.includes('--dry-run');
   const db = await openQueue();
-  const res = runGate(db, { dryRun });
+
+  // One walk of the 63 MB USCIS index answers every distinct company at once.
+  // Skipped with --no-everify because that walk dominates the runtime.
+  let everify = null;
+  if (!process.argv.includes('--no-everify')) {
+    const companies = db.prepare("SELECT DISTINCT company FROM jobs WHERE queue_status = 'new' AND company <> ''")
+      .all().map((r) => r.company);
+    if (companies.length) {
+      process.stderr.write(`E-Verify: matching ${companies.length} companies in one index pass...\n`);
+      const { everifyLookup } = await import('./everify-check.mjs');
+      everify = await everifyLookup(companies);
+      const tally = {};
+      for (const v of everify.values()) tally[v.status] = (tally[v.status] ?? 0) + 1;
+      process.stderr.write(`E-Verify: ${JSON.stringify(tally)}\n`);
+    }
+  }
+
+  const res = runGate(db, { dryRun, everify });
 
   console.log(`Gated ${res.considered} rows:`);
   console.log(`  ${String(res.promoted).padStart(6)}  llm_ready`);

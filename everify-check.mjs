@@ -115,10 +115,10 @@ const COLS = ['employer', 'dba', 'status', 'everifyPlus', 'enrolled', 'terminate
 // token instead of splintering into L/L/C, THEN punctuation becomes spaces,
 // THEN noise tokens are dropped whole.
 const NOISE = new Set(['INC', 'INCORPORATED', 'LLC', 'CORP', 'CORPORATION', 'CO', 'COMPANY', 'LTD', 'LIMITED', 'LP', 'LLP', 'PLLC', 'PC', 'PA', 'GROUP', 'HOLDING', 'HOLDINGS', 'THE']);
-const norm = (s) => s.toUpperCase().replace(/\./g, '').replace(/[^A-Z0-9 ]/g, ' ')
+export const norm = (s) => s.toUpperCase().replace(/\./g, '').replace(/[^A-Z0-9 ]/g, ' ')
   .split(/\s+/).filter((t) => t && !NOISE.has(t)).join(' ');
 
-const parseDate = (s) => {
+export const parseDate = (s) => {
   const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s || '');
   return m ? new Date(+m[3], +m[1] - 1, +m[2]) : null;
 };
@@ -184,7 +184,7 @@ async function buildIndex() {
 
 // ---------------------------------------------------------------- shared
 
-async function* rows() {
+export async function* rows() {
   if (!existsSync(IDX)) {
     console.error(`index missing — building ${IDX} first...`);
     await buildIndex();
@@ -209,7 +209,12 @@ const table = (list, cols) => {
 
 // Confidence tiers: 0 exact (normalized), 1 prefix, 2 whole-word phrase,
 // 3 raw substring. ENROLLED demands <=1; tiers 2-3 only ever say POSSIBLE.
-function confidence(nq, r) {
+/**
+ * How well a normalized query matches an index row. LOWER is better:
+ * 0 exact, 1 prefix, 2 whole-word-inside, 3 substring, -1 no match.
+ * Exported as matchConfidence so the batch path cannot drift from the CLI's.
+ */
+export function matchConfidence(nq, r) {
   const ne = norm(r.employer);
   const nd = norm(r.dba);
   if (ne === nq || (nd && nd === nq)) return 0;
@@ -228,7 +233,7 @@ async function cmdCheck(q) {
   }
   const matches = [];
   for await (const r of rows()) {
-    const conf = confidence(nq, r);
+    const conf = matchConfidence(nq, r);
     if (conf < 0) continue;
     // A termination date on an Open account is a red flag even before the
     // status flips — surface it, don't count it as a clean enrollment.
@@ -298,11 +303,162 @@ async function cmdStates() {
   else console.log(JSON.stringify(list, null, 2));
 }
 
+// ---------------------------------------------------------------- batch
+
+const stripSpaces = (s) => s.replace(/ /g, '');
+
+/**
+ * Every query whose opening characters could possibly match this row.
+ *
+ * A match may begin at ANY token of the employer name (the whole-word tier) and
+ * may span token boundaries once spaces are stripped (the slug tier), so the
+ * keys are the space-stripped prefixes of every token SUFFIX. Prefix lengths
+ * 1..k are all emitted because a query's stripped form can be shorter than k
+ * ("A B" strips to "AB"); missing that key would silently hide a real match,
+ * which is the expensive error.
+ */
+function candidateQueries(r, buckets, k) {
+  const keys = new Set();
+  for (const field of [r.employer, r.dba]) {
+    if (!field) continue;
+    const n = norm(field);
+    if (!n) continue;
+    const tokens = n.split(' ').filter(Boolean);
+    for (let i = 0; i < tokens.length; i++) {
+      const suffix = stripSpaces(tokens.slice(i).join(' '));
+      for (let L = 1; L <= k; L++) {
+        if (L > suffix.length) break;
+        keys.add(suffix.slice(0, L));
+      }
+    }
+  }
+  const out = [];
+  for (const key of keys) {
+    const bucket = buckets.get(key);
+    if (bucket) out.push(...bucket);
+  }
+  return out;
+}
+
+/**
+ * Match confidence for the BATCH path. Lower is better.
+ *
+ * Two deliberate differences from the CLI's matchConfidence:
+ *
+ *   + a space-stripped tier, because every `company` value in the queue is an
+ *     ATS tenant slug ("capitalone", "generalmotors") while the USCIS record is
+ *     a spaced legal name ("CAPITAL ONE, N.A."). Without it, word-boundary
+ *     matching never fires and virtually everything reads as not_found.
+ *     Gated on length >= 4 so a short slug like "cat" cannot prefix-claim
+ *     CATHOLIC HEALTH INITIATIVES, and gated on the query SPANNING a token
+ *     boundary so it stays a de-concatenation rather than becoming a plain
+ *     prefix match — otherwise "meta" claims METAGENOMI INC and "lovable"
+ *     claims LOVABLE KIDS KARE LLC.
+ *
+ *   - no bare-substring tier. The CLI shows those as weak matches for a human to
+ *     judge; unattended across 961k rows they are mostly noise, and here the
+ *     verdict is consumed by a ranker with nobody reading it.
+ */
+function batchConfidence(q, r) {
+  const SLUG_MIN = 4;
+  for (const field of [r.employer, r.dba]) {
+    if (!field) continue;
+    const n = norm(field);
+    if (!n) continue;
+    const s = stripSpaces(n);
+    if (n === q.nq || s === q.sq) return 0;
+    if (n.startsWith(q.nq + ' ')) return 1;
+    // The slug tier only fires when the query reaches PAST the first token, i.e.
+    // it genuinely de-concatenates a multi-word name. A query that merely
+    // prefixes the first token is an unrelated collision.
+    const firstToken = n.slice(0, n.indexOf(' ') === -1 ? n.length : n.indexOf(' '));
+    if (q.sq.length >= SLUG_MIN && q.sq.length > firstToken.length && s.startsWith(q.sq)) return 1;
+    if (` ${n} `.includes(` ${q.nq} `)) return 2;
+  }
+  return -1;
+}
+
+/**
+ * Answer MANY companies in ONE walk of the index.
+ *
+ * The gate needs ~1,900 verdicts; calling the CLI once each would stream 63 MB
+ * that many times. This walks once and tests every row against every query.
+ *
+ * The verdict vocabulary is two-valued on purpose. The USCIS export lists only
+ * ENROLLED employers, so a miss proves a name mismatch (brand vs legal name),
+ * never non-enrollment. Hence `not_found`, never `not_enrolled` — callers must
+ * rank on this signal rather than reject on it.
+ *
+ * @param {string[]} companies
+ * @param {{rows?: () => AsyncIterable<object>}} [opts]  injectable for tests
+ * @returns {Promise<Map<string, {status:string, employer?:string, conf?:number}>>}
+ *   keyed by the ORIGINAL company string. status:
+ *   enrolled | terminated | not_found | too_generic
+ */
+export async function everifyLookup(companies, { rows: rowSource = rows } = {}) {
+  const out = new Map();
+  const queries = [];
+  for (const c of companies) {
+    const nq = norm(String(c ?? ''));
+    // A 1-2 character query matches a large fraction of 961k employers and the
+    // answer would be meaningless. Refuse rather than return noise.
+    if (nq.length < 3) { out.set(c, { status: 'too_generic' }); continue; }
+    out.set(c, { status: 'not_found' });
+    queries.push({ original: c, nq, sq: nq.replace(/ /g, '') });
+  }
+  if (!queries.length) return out;
+
+  // Bucket queries by their first BUCKET_KEY characters (spaces removed). Every
+  // match tier below requires the query's opening characters to appear either at
+  // the start of the employer name or at the start of one of its tokens, so this
+  // is a sound pre-filter — and it turns an O(961k × 1,900) scan, which does not
+  // finish, into a handful of comparisons per row.
+  const BUCKET_KEY = 3;
+  const buckets = new Map();
+  for (const q of queries) {
+    const k = q.sq.slice(0, BUCKET_KEY);
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k).push(q);
+  }
+
+  const best = new Map(); // original -> { conf, statusRank, enrolledAt, employer, clean }
+  for await (const r of rowSource()) {
+    const candidates = candidateQueries(r, buckets, BUCKET_KEY);
+    for (const q of candidates) {
+      const conf = batchConfidence(q, r);
+      if (conf < 0) continue;
+      // An Open account carrying a termination date is a red flag even before
+      // the status flips, so it is not counted as a clean enrollment.
+      const clean = r.status === 'Open' && !parseDate(r.terminated);
+      const statusRank = clean ? 0 : r.status === 'Open' ? 1 : 2;
+      const enrolledAt = parseDate(r.enrolled)?.getTime() ?? 0;
+      const prev = best.get(q.original);
+      if (!prev || conf < prev.conf || (conf === prev.conf &&
+          (statusRank < prev.statusRank ||
+           (statusRank === prev.statusRank && enrolledAt > prev.enrolledAt)))) {
+        best.set(q.original, { conf, statusRank, enrolledAt, employer: r.employer, clean });
+      }
+    }
+  }
+  for (const [original, m] of best) {
+    out.set(original, { status: m.clean ? 'enrolled' : 'terminated', employer: m.employer, conf: m.conf });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- main
 
-if (cmd === 'index') await buildIndex();
-else if (cmd === 'check') await cmdCheck(args.slice(1).filter((a) => !a.startsWith('--')).join(' '));
-else if (cmd === 'states') await cmdStates();
-else {
-  console.log('usage: node everify-check.mjs <index|check <company>|states> [--summary]');
+async function main() {
+  if (cmd === 'index') await buildIndex();
+  else if (cmd === 'check') await cmdCheck(args.slice(1).filter((a) => !a.startsWith('--')).join(' '));
+  else if (cmd === 'states') await cmdStates();
+  else {
+    console.log('usage: node everify-check.mjs <index|check <company>|states> [--summary]');
+  }
 }
+
+// Guarded so the batch path above can be imported without running the CLI.
+const invoked = process.argv[1] && (
+  import.meta.url === `file://${process.argv[1]}` ||
+  import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, '/')}`).href);
+if (invoked) await main();

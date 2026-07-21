@@ -194,10 +194,17 @@ export function upsertJobs(db, offers, { now = Date.now() } = {}) {
 export function listReady(db, { now = Date.now(), limit = Infinity } = {}) {
   const placeholders = DRAINABLE_STATES.map(() => '?').join(', ');
   const rows = db.prepare(`SELECT * FROM jobs WHERE queue_status IN (${placeholders})`).all(...DRAINABLE_STATES);
+  // Freshness leads (being first to apply is the whole strategy), then E-Verify:
+  // a confirmed-enrolled employer can actually hire on STEM OPT, so it is drained
+  // before an unconfirmed one of equal age. `not_found` is only a name mismatch,
+  // never a rejection, so it still drains — just later.
+  const everifyRank = (s) => (s === 'enrolled' ? 0 : s === 'terminated' ? 2 : 1);
   return rows
     .map((r) => ({ r, f: classifyFreshness({ postedAt: r.posted_at, confidence: r.posted_at_confidence, now }) }))
     .filter((x) => x.f.sendable)
-    .sort((a, b) => a.f.priority - b.f.priority || (a.f.ageDays ?? 0) - (b.f.ageDays ?? 0))
+    .sort((a, b) => a.f.priority - b.f.priority
+      || everifyRank(a.r.everify_status) - everifyRank(b.r.everify_status)
+      || (a.f.ageDays ?? 0) - (b.f.ageDays ?? 0))
     .slice(0, limit)
     .map((x) => ({ ...x.r, freshness: x.f }));
 }
