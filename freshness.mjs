@@ -34,6 +34,71 @@ const DAY = 86_400_000;
 
 export const DEFAULT_THRESHOLDS = { hot: 0, fresh: 3, backup: 7 };
 
+/**
+ * Encode "N calendar days before now" as UTC midnight of that day.
+ *
+ * Coarse ATS labels ("Posted Today", "Posted 5 Days Ago") name a DAY, not an
+ * instant, and every date in this pipeline is stored day-granular: scan.mjs
+ * writes `posted: YYYY-MM-DD` via toISOString().slice(0, 10) and
+ * queue-migrate.mjs reads it back with Date.UTC(y, m, d). Anchoring a relative
+ * label to the raw clock instant instead breaks that round-trip whenever the
+ * machine's local date and the UTC date disagree — a real scan run at 22:41
+ * Pacific (05:41Z the next day) wrote tomorrow's date, and 972 queued rows read
+ * one day fresher than they actually were.
+ *
+ * So: anchor to the scanner's LOCAL calendar day, store UTC midnight of it. The
+ * value then renders back to exactly that day in any timezone. Date.UTC
+ * normalizes an out-of-range day, so month/year boundaries need no special case.
+ *
+ * @param {number} [daysAgo]  whole days back from `now` (0 = today)
+ * @param {number} [now]      epoch ms reference (injectable for tests)
+ * @returns {number} epoch ms at UTC midnight of the target calendar day
+ */
+export function calendarDayMs(daysAgo = 0, now = Date.now()) {
+  const d = new Date(now);
+  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate() - daysAgo);
+}
+
+/**
+ * The `--since N` cutoff, safe to compare against either shape of posting date.
+ *
+ * Dates arrive two ways: DAY TOKENS (UTC midnight, from relative ATS labels)
+ * and real INSTANTS (Greenhouse/Lever/Ashby timestamps). A cutoff tuned for one
+ * silently drops the other at the boundary — an instant cutoff always sits
+ * later than a same-day token, and a token cutoff can sit later than
+ * `now - N days` east of UTC. Taking the earlier of the two is never stricter
+ * than either, so an exactly-N-day-old posting survives in both shapes and in
+ * every timezone.
+ *
+ * Erring wide is the right direction: freshness.mjs is the strict gate that
+ * decides what an LLM actually sees, and this repo's rule is that a lost job is
+ * the one outcome the pipeline refuses.
+ */
+export function sinceCutoffMs(sinceDays, now = Date.now()) {
+  return Math.min(calendarDayMs(sinceDays, now), now - sinceDays * DAY);
+}
+
+/**
+ * Normalize a posting date to a DAY TOKEN so ages can be counted in whole
+ * calendar days regardless of which shape the value arrived in.
+ *
+ * Queue rows are already tokens (UTC midnight). Raw provider instants
+ * (Greenhouse/Lever/Ashby) are not, and differencing an instant against today's
+ * token mixes frames: west of UTC a raw timestamp exactly 8 elapsed days old
+ * measured as 7 and stayed `backup` — a stale posting that would have reached
+ * an LLM. Collapsing the instant to its own local calendar day first makes both
+ * operands the same kind of value, so the subtraction is exact.
+ *
+ * A value already on an exact UTC-midnight boundary is taken as a token. A real
+ * provider timestamp landing on that millisecond is vanishingly unlikely, and
+ * if one does, UTC midnight *is* that day — so the reading is right either way.
+ */
+function dayTokenOf(ms) {
+  if (ms % DAY === 0) return ms;
+  const d = new Date(ms);
+  return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
 // Bucket metadata: draining priority (lower = sooner) and whether an LLM may
 // ever see it. stale/unknown are terminal — they cost zero tokens by design.
 const BUCKETS = {
@@ -63,7 +128,17 @@ export function classifyFreshness({ postedAt, confidence, now = Date.now(), thre
     return make('unknown', null, 'no reliable posting date');
   }
 
-  const ageDays = Math.max(0, Math.floor((now - postedAt) / DAY));
+  // `postedAt` is a DAY TOKEN — UTC midnight of the posting's calendar day.
+  // Every queue row is one: pipeline.md stores dates day-granular and
+  // queue-migrate.mjs parses them back with Date.UTC, so gate.mjs and
+  // queue.mjs only ever hand this function tokens. Age is therefore counted in
+  // whole calendar days against today's token, never as an elapsed-millisecond
+  // span: a row posted today and read at 22:41 local is 0 days old, not 1, and
+  // a row exactly at the 7-day ceiling stays `backup` instead of tipping into
+  // `stale`. dayTokenOf also collapses a raw provider instant to its own
+  // calendar day, so both operands are the same kind of value and the
+  // subtraction is exact (Math.round is then only defensive).
+  const ageDays = Math.max(0, Math.round((calendarDayMs(0, now) - dayTokenOf(postedAt)) / DAY));
 
   // A lower bound can only prove "old enough to be stale". Anything short of
   // that is genuinely unknown — the true age has no upper bound.

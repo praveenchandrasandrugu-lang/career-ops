@@ -46,6 +46,7 @@ import yaml from 'js-yaml';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, loadQueueSeenUrls, CanonicalUrlSet, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
 import { makeHttpCtx } from './providers/_http.mjs';
+import { calendarDayMs, sinceCutoffMs } from './freshness.mjs';
 import { pathToFileURL } from 'url';
 
 const PORTALS_PATH = process.env.CAREER_OPS_PORTALS || 'portals.yml';
@@ -106,10 +107,13 @@ function parseTenant(line) {
  * cutoff and slip through as fresh. Returns {at, exact} so the caller can treat
  * a bound differently from a real age.
  */
-export function postedAtFrom(posted) {
+export function postedAtFrom(posted, now = Date.now()) {
   if (!posted) return null;
   const s = String(posted).toLowerCase();
-  const mk = (days, exact) => ({ at: Date.now() - days * 86_400_000, exact, days });
+  // `at` is a DAY TOKEN (UTC midnight of the local calendar day), not the raw
+  // instant — see calendarDayMs. Anchoring to the instant wrote tomorrow's date
+  // whenever the machine's local date and the UTC date disagreed.
+  const mk = (days, exact) => ({ at: calendarDayMs(days, now), exact, days });
   if (s.includes('today') || s.includes('just posted')) return mk(0, true);
   if (s.includes('yesterday')) return mk(1, true);
   const m = /(\d+)(\+?)\s*day/.exec(s);
@@ -279,7 +283,7 @@ export async function scanTenant(ctx, t, keywords, cutoff, sinceDays, out, seen,
 export async function main() {
   const sinceDays = Number(opt('--since', '30'));
   const limit = Number(opt('--limit', '50'));
-  const cutoff = Date.now() - sinceDays * 86_400_000;
+  const cutoff = sinceCutoffMs(sinceDays);
   const dry = flag('--dry-run');
 
   if (!KEYWORDS.length) {

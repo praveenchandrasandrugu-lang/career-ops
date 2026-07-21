@@ -12,6 +12,7 @@
 // and omitted for the unbounded "30+ Days Ago" form.
 
 import { BROWSER_LIKE_USER_AGENT } from './_http.mjs';
+import { calendarDayMs } from '../freshness.mjs';
 
 const PAGE_SIZE = 20;
 
@@ -140,13 +141,25 @@ function resolveEndpoint(entry) {
   return null;
 }
 
-function parsePostedOn(label) {
+/**
+ * Resolve a relative "postedOn" label to the calendar day it names.
+ *
+ * These labels name a DAY in the scanner's own calendar, never an instant, so
+ * they are anchored to the local day and stored as UTC midnight of it (see
+ * calendarDayMs). Using the raw clock instant shifted every relative-dated row
+ * by a day whenever the machine's local date differed from the UTC date.
+ *
+ * @param {string|undefined} label  e.g. "Posted Today", "Posted 5 Days Ago"
+ * @param {number} [now]            epoch ms reference (injectable for tests)
+ * @returns {number|undefined} epoch ms, or undefined when no usable date exists
+ */
+export function parsePostedOn(label, now = Date.now()) {
   if (!label) return undefined;
-  if (/posted\s+today/i.test(label)) return Date.now();
-  if (/posted\s+yesterday/i.test(label)) return Date.now() - 86_400_000;
+  if (/posted\s+today/i.test(label)) return calendarDayMs(0, now);
+  if (/posted\s+yesterday/i.test(label)) return calendarDayMs(1, now);
   const m = label.match(/posted\s+(\d+)(\+?)\s*day/i);
   if (!m || m[2] === '+') return undefined; // "30+ Days Ago" — unbounded, no usable date
-  return Date.now() - Number(m[1]) * 86_400_000;
+  return calendarDayMs(Number(m[1]), now);
 }
 
 // Workday URL path encodes location as /job/{Location-Slug}/{title-slug}.
@@ -159,7 +172,10 @@ function locationFromPath(externalPath) {
   return segment.replace(/-/g, ' ');
 }
 
-export function parseWorkdayResponse(json, entry) {
+// `now` is snapshotted once per response so every posting on a page resolves
+// against the same calendar day — a long scan crossing local midnight would
+// otherwise split one page's "Posted Today" rows across two dates.
+export function parseWorkdayResponse(json, entry, now = Date.now()) {
   const ep = resolveEndpoint(entry);
   const jobBase = ep?.jobBase || '';
   const postings = Array.isArray(json?.jobPostings) ? json.jobPostings : [];
@@ -172,7 +188,7 @@ export function parseWorkdayResponse(json, entry) {
       url: jobBase + j.externalPath,
       company: entry.name,
       location: j.locationsText || locationFromPath(j.externalPath),
-      postedAt: parsePostedOn(j.postedOn),
+      postedAt: parsePostedOn(j.postedOn, now),
     });
   }
   return jobs;

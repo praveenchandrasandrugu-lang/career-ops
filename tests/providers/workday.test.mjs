@@ -586,6 +586,83 @@ try {
     fail(`workday probe should emit no warning, got: ${JSON.stringify(probeWarnings)}`);
   }
 
+  // ── relative "postedOn" labels name a CALENDAR DAY, not an instant ────────
+  //
+  // Workday reports only relative labels ("Posted Today", "Posted 5 Days Ago").
+  // Those name a day in the scanner's own calendar, so they must be anchored to
+  // the LOCAL day and encoded as UTC midnight of it — the same encoding
+  // queue-migrate.mjs parses back with Date.UTC() and scan.mjs renders with
+  // toISOString().slice(0, 10).
+  //
+  // Returning the raw instant instead (the original bug) shifted every
+  // relative-dated row by a day whenever the machine's local date differed from
+  // the UTC date: a real scan run at 22:41 Pacific wrote tomorrow's date, and
+  // 972 rows landed in the queue reading one day fresher than they were.
+  const { parsePostedOn } = workdayModule;
+  const render = (ms) => new Date(ms).toISOString().slice(0, 10);
+  const pad = (n) => String(n).padStart(2, '0');
+  const localDay = (ms) => {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  };
+
+  if (typeof parsePostedOn === 'function') {
+    pass('workday exports parsePostedOn (testable relative-date anchoring)');
+
+    // Across a full 24h sweep, the written date must always equal the local
+    // calendar day. On any machine east or west of UTC this catches the shift.
+    let sweepBad = null;
+    for (let h = 0; h < 24 && !sweepBad; h++) {
+      const now = Date.UTC(2026, 6, 21, h, 30);
+      const got = render(parsePostedOn('Posted Today', now));
+      if (got !== localDay(now)) sweepBad = `at ${h}:30Z wrote ${got}, local day is ${localDay(now)}`;
+    }
+    if (!sweepBad) pass('workday "Posted Today" renders the local calendar day at every hour of the day');
+    else fail(`workday "Posted Today" off by one — ${sweepBad}`);
+
+    // A specific relative count anchors to the same local day, N days back.
+    const nowAug = Date.UTC(2026, 7, 2, 12, 0);
+    const back5 = parsePostedOn('Posted 5 Days Ago', nowAug);
+    const expect5 = (() => { const d = new Date(nowAug); return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate() - 5); })();
+    if (back5 === expect5) pass('workday "Posted 5 Days Ago" anchors to the local day minus 5 (month boundary safe)');
+    else fail(`workday relative count wrong: got ${render(back5)}, expected ${render(expect5)}`);
+
+    // The result must be exactly UTC midnight, or the value stops round-tripping
+    // through pipeline.md's date-only `posted:` field.
+    const mid = parsePostedOn('Posted Today', Date.UTC(2026, 6, 21, 5, 41));
+    if (mid % 86_400_000 === 0) pass('workday relative dates are encoded as UTC midnight (round-trips through pipeline.md)');
+    else fail(`workday relative date is not UTC midnight: ${new Date(mid).toISOString()}`);
+
+    // Unchanged: an unbounded label yields no date at all, and neither does junk.
+    if (parsePostedOn('Posted 30+ Days Ago', Date.now()) === undefined &&
+        parsePostedOn('', Date.now()) === undefined &&
+        parsePostedOn(undefined, Date.now()) === undefined) {
+      pass('workday "30+ Days Ago"/empty still yield no date (lower bound stays unusable)');
+    } else {
+      fail('workday unbounded/empty label should return undefined');
+    }
+
+    // Machine-independent proof: force two timezones a day apart at one fixed
+    // instant and require the written date to follow the LOCAL day in each.
+    // 2026-07-21T05:41Z is 2026-07-20 22:41 in Los Angeles but 2026-07-21 17:41
+    // in Auckland — the exact condition that corrupted the real scan.
+    const modUrl = pathToFileURL(join(ROOT, 'providers/workday.mjs')).href;
+    const child = `const m = await import(${JSON.stringify(modUrl)});` +
+      `console.log(new Date(m.parsePostedOn('Posted Today', Date.UTC(2026, 6, 21, 5, 41))).toISOString().slice(0, 10));`;
+    const inTz = (tz) => run(process.execPath, ['--input-type=module', '-e', child], { env: { ...process.env, TZ: tz } });
+    const la = inTz('America/Los_Angeles');
+    const akl = inTz('Pacific/Auckland');
+    if (la === '2026-07-20' && akl === '2026-07-21') {
+      pass('workday relative dates follow the machine\'s local day (TZ-forced: LA=07-20, Auckland=07-21)');
+    } else if (la === null || akl === null) {
+      warn(`workday TZ-forced check could not run (child process failed): LA=${la}, AKL=${akl}`);
+    } else {
+      fail(`workday relative date ignores local TZ: LA=${la} (expected 2026-07-20), Auckland=${akl} (expected 2026-07-21)`);
+    }
+  } else {
+    fail('workday does not export parsePostedOn — relative-date anchoring is untestable');
+  }
+
 } catch (e) {
   fail(`workday provider tests crashed: ${e.message}`);
 }

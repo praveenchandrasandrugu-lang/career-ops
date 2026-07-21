@@ -40,6 +40,11 @@ import ashby from './providers/ashby.mjs';
 import workday from './providers/workday.mjs';
 import { buildTitleFilter, buildLocationFilter, loadSeenUrls, loadQueueSeenUrls, appendToPipeline, appendToScanHistory } from './scan.mjs';
 import { AdaptiveLimiter, limitHttpCtx } from './adaptive-limiter.mjs';
+// The --since cutoff must compare safely against BOTH shapes of posting date
+// this scanner sees: day tokens from Workday's relative labels and real
+// instants from Greenhouse/Lever/Ashby. sinceCutoffMs takes the earlier of the
+// two candidate cutoffs so neither shape loses a posting exactly N days old.
+import { sinceCutoffMs } from './freshness.mjs';
 import { SEED_SOURCES, toPortalEntry } from './seeds/vc-portfolios.mjs';
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -305,7 +310,7 @@ export async function runSeedScan(seedId, opts, ctx, seenUrls, label) {
       : companies.slice(0, opts.limit))
     : companies;
 
-  const cutoff = Date.now() - opts.sinceDays * 86_400_000;
+  const cutoff = sinceCutoffMs(opts.sinceDays);
   const offers = [];
   let errors = 0;
 
@@ -397,7 +402,7 @@ async function filterLive(offers) {
 
 async function main() {
   const opts = parseArgs(process.argv);
-  const cutoff = Date.now() - opts.sinceDays * 86_400_000;
+  const cutoff = sinceCutoffMs(opts.sinceDays);
   // In --json mode, stdout is reserved for the single machine-readable result,
   // so every human-facing line goes to stderr instead.
   const log = opts.json ? (...a) => console.error(...a) : (...a) => console.log(...a);

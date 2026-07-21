@@ -40,6 +40,7 @@ import { makeHttpCtx } from './providers/_http.mjs';
 import { buildTrustValidator } from './providers/_trust-validator.mjs';
 import { loadProviders, resolveProvider } from './providers/_registry.mjs';
 import { mergeProviderPlugins } from './plugins/_engine.mjs';
+import { sinceCutoffMs } from './freshness.mjs';
 import { classifyFetchError } from './verify-portals.mjs';
 import { fingerprintText, findCrossListings } from './fingerprint-core.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
@@ -187,7 +188,11 @@ export function buildLocationFilter(locationFilter) {
 export function buildPostingAgeFilter(maxAgeDays, now = Date.now()) {
   const max = Number(maxAgeDays);
   if (!Number.isInteger(max) || max <= 0) return () => true;
-  const cutoff = now - max * 24 * 60 * 60 * 1000; // N days in ms, subtracted from now
+  // Shape-safe cutoff: postedAt reaches here either as a day token (UTC
+  // midnight, from a relative ATS label) or as a real instant (Greenhouse /
+  // Lever / Ashby). A plain `now - N days` cutoff always sits later than a
+  // same-day token and would silently drop every posting exactly N days old.
+  const cutoff = sinceCutoffMs(max, now);
   return (postedAt) => {
     if (typeof postedAt !== 'number' || !Number.isFinite(postedAt)) return true;
     return postedAt >= cutoff;

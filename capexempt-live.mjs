@@ -31,6 +31,7 @@
  *   node capexempt-live.mjs --min-entry 50  # only roster employers with >=50 entry-level LCA filings
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { calendarDayMs } from './freshness.mjs';
 
 const ROSTER_PATH = 'data/lca/capexempt-all.json';
 const DATASET_URL = 'https://raw.githubusercontent.com/Feashliaa/job-board-aggregator/main/data/workday_companies.json';
@@ -214,13 +215,16 @@ async function verifyTenant(cand) {
 }
 
 // ---- step 4: fetch openings -------------------------------------------------
-function parsePostedOn(label) {
+// Relative Workday labels name a calendar DAY, not an instant — see
+// calendarDayMs in freshness.mjs for why anchoring to the raw clock instant
+// shifts the date by a day west/east of UTC. Same policy as providers/workday.mjs.
+function parsePostedOn(label, now = Date.now()) {
   if (!label) return null;
-  if (/posted\s+today/i.test(label)) return Date.now();
-  if (/posted\s+yesterday/i.test(label)) return Date.now() - 86_400_000;
+  if (/posted\s+today/i.test(label)) return calendarDayMs(0, now);
+  if (/posted\s+yesterday/i.test(label)) return calendarDayMs(1, now);
   const m = label.match(/posted\s+(\d+)(\+?)\s*day/i);
   if (!m || m[2] === '+') return null;
-  return Date.now() - Number(m[1]) * 86_400_000;
+  return calendarDayMs(Number(m[1]), now);
 }
 
 async function cxsPage(tenant, instance, site, searchText, offset) {
@@ -360,7 +364,12 @@ async function main() {
     lines.push(`Board identifies as: **${g.board}** | LCA history: ${g.meta.filings} filings, ${g.meta.entryLevel} entry-level, median $${g.meta.medianWage?.toLocaleString?.() || g.meta.medianWage} | States: ${g.meta.states}`);
     lines.push(``);
     for (const j of g.jobs.sort((a, b) => (b.postedAt || 0) - (a.postedAt || 0))) {
-      const age = j.postedAt ? `${Math.round((Date.now() - j.postedAt) / 86_400_000)}d` : '30d+';
+      // postedAt is a day token, so age is a difference of calendar days — an
+      // elapsed-millisecond span would render "Posted Today" as 1d whenever the
+      // report is generated late in the local day.
+      const age = j.postedAt
+        ? `${Math.max(0, Math.round((calendarDayMs(0) - j.postedAt) / 86_400_000))}d`
+        : '30d+';
       lines.push(`- [${j.title}](${j.url}) — ${j.location || 'location on posting'} (${age})`);
     }
     lines.push(``);

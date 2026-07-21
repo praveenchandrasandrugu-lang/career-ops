@@ -15,11 +15,16 @@
  * Run: node tests/freshness.test.mjs   (or via test-all.mjs auto-discovery)
  */
 import { pass, fail } from './helpers.mjs';
-import { classifyFreshness, parseRelativeAge, pickNextBatch } from '../freshness.mjs';
+import { classifyFreshness, parseRelativeAge, pickNextBatch, calendarDayMs, sinceCutoffMs } from '../freshness.mjs';
 
 const DAY = 86_400_000;
 const NOW = 1_700_000_000_000; // fixed reference so tests are deterministic
-const ago = (days) => NOW - days * DAY;
+// Ages are day TOKENS (UTC midnight of a calendar day), because that is what
+// every queue row actually holds — pipeline.md is date-only and
+// queue-migrate.mjs parses it with Date.UTC. Using raw instants here would test
+// a shape production never produces, and would hide the off-by-one that made a
+// job posted today read as 1 day old when scanned late in the local evening.
+const ago = (days) => calendarDayMs(days, NOW);
 const T = (label, cond) => (cond ? pass(label) : fail(label, 'assertion failed'));
 
 // ── classifyFreshness: exact ages into each bucket ──────────────────────────
@@ -106,3 +111,75 @@ T('pickNextBatch: respects limit',
   pickNextBatch(jobs, { now: NOW, limit: 2 }).map(j => j.id).join(',') === 'hot0,fresh1');
 T('pickNextBatch: empty input → empty output',
   pickNextBatch([], { now: NOW }).length === 0);
+
+// ── calendarDayMs: a relative label names a DAY, not an instant ─────────────
+// Regression guard for the bug that put 972 rows in the queue one day fresher
+// than they were: "Posted Today" was stored as Date.now(), then rendered with
+// toISOString(), so a scan at 22:41 Pacific (05:41Z the next day) wrote
+// tomorrow's date. The value must be UTC midnight of the LOCAL calendar day so
+// it round-trips through pipeline.md's date-only `posted:` field anywhere.
+const dayPad = (n) => String(n).padStart(2, '0');
+const localDayOf = (ms) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${dayPad(d.getMonth() + 1)}-${dayPad(d.getDate())}`;
+};
+const renderDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+let sweepFail = null;
+for (let h = 0; h < 24 && !sweepFail; h++) {
+  const at = Date.UTC(2026, 6, 21, h, 30);
+  if (renderDay(calendarDayMs(0, at)) !== localDayOf(at)) sweepFail = `${h}:30Z`;
+}
+T('calendarDayMs: today renders the local calendar day at every hour', sweepFail === null);
+
+T('calendarDayMs: result is exactly UTC midnight (round-trips as a date-only field)',
+  calendarDayMs(0, Date.UTC(2026, 6, 21, 5, 41)) % DAY === 0);
+
+T('calendarDayMs: N days back is exactly N days before today',
+  calendarDayMs(0, NOW) - calendarDayMs(5, NOW) === 5 * DAY);
+
+// Date.UTC normalizes an out-of-range day, so crossing a month or year edge
+// needs no special case — pin it so a "clever" rewrite cannot regress it.
+// The expectation is derived from the LOCAL day of the reference instant rather
+// than hard-coded, because calendarDayMs is local-anchored by design: a
+// hard-coded UTC date would fail under TZ=Pacific/Auckland (Codex review).
+const expectDaysBack = (ref, n) => {
+  const d = new Date(ref);
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  t.setUTCDate(t.getUTCDate() - n);
+  return t.toISOString().slice(0, 10);
+};
+const monthRef = Date.UTC(2026, 7, 2, 12, 0);
+T('calendarDayMs: crosses a month boundary correctly',
+  renderDay(calendarDayMs(5, monthRef)) === expectDaysBack(monthRef, 5));
+const yearRef = Date.UTC(2026, 0, 2, 12, 0);
+T('calendarDayMs: crosses a year boundary correctly',
+  renderDay(calendarDayMs(3, yearRef)) === expectDaysBack(yearRef, 3));
+
+// Boundary parity: scan-ats-full.mjs drops a posting when postedAt < cutoff.
+// Both sides are day-granular now, so an exactly-N-day-old posting survives the
+// --since N window. Pinned against the real gate rather than restated here.
+{
+  const { classifyPostingDate } = await import('../scan-ats-full.mjs');
+  // Built with sinceCutoffMs — the helper the scanners actually call — so this
+  // exercises the real boundary in every timezone, half-hour offsets included.
+  const cutoff = sinceCutoffMs(7, NOW);
+  T('scan cutoff: a day-token posting exactly 7 days old survives --since 7',
+    classifyPostingDate({ postedAt: calendarDayMs(7, NOW) }, cutoff) === 'keep');
+  T('scan cutoff: a raw instant exactly 7 days old survives --since 7',
+    classifyPostingDate({ postedAt: NOW - 7 * DAY }, cutoff) === 'keep');
+  T('scan cutoff: a day-token posting 8 days old is still dropped by --since 7',
+    classifyPostingDate({ postedAt: calendarDayMs(8, NOW) }, cutoff) === 'stale');
+}
+
+// ── raw provider instants age by calendar day, not elapsed milliseconds ─────
+// Greenhouse/Lever/Ashby hand over real timestamps rather than day tokens.
+// Differencing an instant against today's token mixed two frames: west of UTC a
+// timestamp exactly 8 elapsed days old measured as 7 and stayed `backup`, so a
+// stale posting would have reached an LLM (Codex review).
+T('freshness: a raw instant 8 elapsed days old is stale, not backup',
+  classifyFreshness({ postedAt: NOW - 8 * DAY, confidence: 'exact', now: NOW }).bucket === 'stale');
+T('freshness: a raw instant 7 elapsed days old is backup (still inside the ceiling)',
+  classifyFreshness({ postedAt: NOW - 7 * DAY, confidence: 'exact', now: NOW }).bucket === 'backup');
+T('freshness: a raw instant from earlier today is hot',
+  classifyFreshness({ postedAt: NOW - 60_000, confidence: 'exact', now: NOW }).bucket === 'hot');
