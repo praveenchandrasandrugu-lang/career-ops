@@ -16,6 +16,7 @@
  * riskiest decision per code review.
  */
 
+import { randomUUID } from 'node:crypto';
 import { classifyFreshness } from './freshness.mjs';
 
 // ── node:sqlite loading (mirrors tracker.mjs) ───────────────────────────────
@@ -108,7 +109,20 @@ export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/
   // CREATE TABLE IF NOT EXISTS silently skips an EXISTING table, so a column
   // added after a DB was first created has to be ALTERed in. Additive-only, so
   // it is safe to run on every open and needs no version bookkeeping.
-  addMissingColumns(db, { location: "TEXT NOT NULL DEFAULT ''" });
+  addMissingColumns(db, {
+    location: "TEXT NOT NULL DEFAULT ''",
+    // Claim bookkeeping. `claimed_at` is what makes a crashed worker
+    // recoverable: without it an abandoned row sits in_progress forever and is
+    // invisible to both the drain and the gate.
+    claimed_at: 'INTEGER',
+    claimed_by: 'TEXT',
+    // Fencing token: unique per CLAIM, not per worker. Guarding a finish on
+    // `queue_status='in_progress'` alone is not ownership — a worker that
+    // stalls long enough to be reclaimed can wake up and close out a row that
+    // now belongs to someone else, silently discarding the new worker's result.
+    // Every transition out of a claim must present the token it was issued.
+    claim_token: 'TEXT',
+  });
   return db;
 }
 
@@ -207,6 +221,159 @@ export function listReady(db, { now = Date.now(), limit = Infinity } = {}) {
       || (a.f.ageDays ?? 0) - (b.f.ageDays ?? 0))
     .slice(0, limit)
     .map((x) => ({ ...x.r, freshness: x.f }));
+}
+
+// ── the claim: handing rows to workers without ever handing one out twice ───
+//
+// A duplicate claim is not a cosmetic bug. It means two workers evaluate the
+// same posting, spend the tokens twice, and can put two applications in front
+// of one real employer. So ownership has to be provable, not assumed.
+//
+// Drain ORDER is computed in JS (freshness is read-time, never stored), so the
+// claim cannot be one `UPDATE ... ORDER BY ... LIMIT`. Instead each candidate is
+// taken with a conditional update whose `changes === 1` IS the proof: SQLite
+// applies the row's WHERE test and its write as one atomic step, so exactly one
+// caller can observe the transition out of `llm_ready`. A loser sees 0 and
+// simply moves on. This is the #749 report-number race one layer down, and the
+// fix is the same shape: let the write itself be the lock.
+
+/** Rows a claim may end in. `skipped` covers "looked at it, not worth a report". */
+const TERMINAL_STATES = ['evaluated', 'skipped'];
+
+/**
+ * Atomically claim up to `limit` drainable rows, in drain order.
+ *
+ * Returns FEWER than `limit` when another worker took candidates in between —
+ * that is normal contention, not an error. Callers that want a full batch
+ * should simply call again.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {{limit?:number, now?:number, workerId?:string}} [opts]
+ * @returns {Array<object>} the claimed rows, each with its `.freshness`
+ */
+export function claimNext(db, { limit = 1, now = Date.now(), workerId = 'worker' } = {}) {
+  const want = Math.max(0, Math.floor(limit));
+  if (!want) return [];
+  const candidates = listReady(db, { now, limit: want });
+  if (!candidates.length) return [];
+
+  const take = db.prepare(`
+    UPDATE jobs SET queue_status = 'in_progress', claimed_at = ?, claimed_by = ?, claim_token = ?
+    WHERE canonical_url = ? AND queue_status = 'llm_ready'
+  `);
+  const claimed = [];
+  // BEGIN IMMEDIATE takes the write lock up front, so a concurrent claimer
+  // blocks (busy_timeout) instead of racing us mid-batch.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const row of candidates) {
+      const token = randomUUID();
+      if (take.run(now, String(workerId), token, row.canonical_url).changes === 1) {
+        claimed.push({
+          ...row, queue_status: 'in_progress', claimed_at: now, claimed_by: String(workerId), claim_token: token,
+        });
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    // Best-effort rollback: if it also throws, the ORIGINAL failure is the one
+    // worth reporting — masking it with a rollback error hides the real cause.
+    try { db.exec('ROLLBACK'); } catch { /* connection is already unusable */ }
+    throw e;
+  }
+  return claimed;
+}
+
+/**
+ * Finish a claimed row. Guarded on `in_progress`, so a worker cannot close out
+ * a row it does not hold (a late reply from a reclaimed worker is a no-op).
+ * @returns {boolean} true when this caller actually owned the row
+ */
+export function completeClaim(db, canonicalUrl, { status = 'evaluated', reason = null, token = null } = {}) {
+  if (!TERMINAL_STATES.includes(status)) {
+    throw new Error(`completeClaim: status must be one of ${TERMINAL_STATES.join('/')}, got ${JSON.stringify(status)}`);
+  }
+  return db.prepare(`
+    UPDATE jobs SET queue_status = ?, claimed_at = NULL, claimed_by = NULL, claim_token = NULL,
+                    skip_reason = COALESCE(?, skip_reason)
+    WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
+  `).run(status, reason, canonicalUrl, token).changes === 1;
+}
+
+/**
+ * Hand a claimed row back untouched (worker shutting down, batch trimmed). No
+ * retry is counted: nothing went wrong, the row was simply not worked.
+ * @returns {boolean} true when this caller actually owned the row
+ */
+export function releaseClaim(db, canonicalUrl, { token = null } = {}) {
+  return db.prepare(`
+    UPDATE jobs SET queue_status = 'llm_ready', claimed_at = NULL, claimed_by = NULL, claim_token = NULL
+    WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
+  `).run(canonicalUrl, token).changes === 1;
+}
+
+/**
+ * Record a failed attempt. Returns the row to the queue until `maxRetries` is
+ * exhausted, then parks it as `failed` so one poison posting cannot occupy a
+ * worker forever.
+ * @returns {{status:string, retryCount:number}|null} null when not owned
+ */
+export function failClaim(db, canonicalUrl, { reason = null, maxRetries = 3, token = null } = {}) {
+  // The increment and the terminal decision happen INSIDE one guarded UPDATE.
+  // Reading retry_count first and writing it back was a read-modify-write race:
+  // between the two statements the row could be reclaimed and re-claimed, and
+  // the write would then land on somebody else's claim. In SQLite the right-hand
+  // `retry_count` is the pre-update value, so `retry_count + 1` is the new count.
+  const changed = db.prepare(`
+    UPDATE jobs SET
+      retry_count  = retry_count + 1,
+      queue_status = CASE WHEN retry_count + 1 >= ? THEN 'failed' ELSE 'llm_ready' END,
+      claimed_at = NULL, claimed_by = NULL, claim_token = NULL,
+      skip_reason  = COALESCE(?, skip_reason)
+    WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
+  `).run(maxRetries, reason, canonicalUrl, token).changes;
+  if (changed !== 1) return null; // not ours (reclaimed, or never held)
+  const row = db.prepare('SELECT queue_status, retry_count FROM jobs WHERE canonical_url = ?').get(canonicalUrl);
+  return { status: row.queue_status, retryCount: row.retry_count };
+}
+
+/**
+ * Recover rows whose worker died holding them.
+ *
+ * Without this a crashed drain silently shrinks the queue every run: the rows
+ * stay `in_progress`, so they are neither drainable nor visibly stuck. A
+ * reclaim counts as a retry, so a row that reliably kills its worker is parked
+ * as `failed` instead of cycling forever.
+ *
+ * @returns {string[]} the canonical URLs actually recovered
+ */
+export function reclaimStale(db, { staleAfterMs = 3_600_000, now = Date.now(), maxRetries = 3 } = {}) {
+  // `claimed_at IS NULL` is deliberately included: a row left in_progress by a
+  // build that predates claim bookkeeping (or by a crash between the two) has no
+  // timestamp, and excluding it would strand the row forever — invisible to the
+  // drain AND to this recovery pass. Treat missing bookkeeping as instantly stale.
+  const stale = db.prepare(`
+    SELECT canonical_url, retry_count, claim_token FROM jobs
+    WHERE queue_status = 'in_progress' AND (claimed_at IS NULL OR claimed_at < ?)
+  `).all(now - staleAfterMs);
+  // The UPDATE re-checks the exact claim the SELECT saw. Without that, a row
+  // reclaimed and re-claimed by a new worker between the two statements would
+  // have its fresh claim wiped by this pass.
+  const put = db.prepare(`
+    UPDATE jobs SET queue_status = ?, retry_count = ?, claimed_at = NULL, claimed_by = NULL, claim_token = NULL,
+                    skip_reason = COALESCE(?, skip_reason)
+    WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
+  `);
+  const recovered = [];
+  for (const row of stale) {
+    const retryCount = row.retry_count + 1;
+    const status = retryCount >= maxRetries ? 'failed' : 'llm_ready';
+    const reason = status === 'failed' ? `abandoned by worker ${maxRetries}x` : null;
+    if (put.run(status, retryCount, reason, row.canonical_url, row.claim_token).changes === 1) {
+      recovered.push(row.canonical_url);
+    }
+  }
+  return recovered;
 }
 
 /**
