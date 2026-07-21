@@ -161,6 +161,8 @@ const SYSTEM_PATHS = [
   'queue.mjs',
   'queue-migrate.mjs',
   'gate.mjs',
+  'jd-fetch.mjs',
+  'fetch-jds.mjs',
   'everify-check.mjs',
   'adaptive-limiter.mjs',
   'capexempt-live.mjs',

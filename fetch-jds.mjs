@@ -51,7 +51,15 @@ const limiter = new AdaptiveLimiter();
 // no matter how many of its postings are in the queue.
 const boardCache = new Map();
 
-const tally = { fetched: 0, gone: 0, failed: 0, unsupported: 0, empty: 0 };
+// Counted at the socket, not at the call site. The limiter books one "request"
+// per limiter.run(), which includes calls that an ashby board cache answered
+// without touching the network — so its figure overstates real traffic and
+// hides the saving the shared-board design exists to produce. Tuning
+// concurrency against that number would be tuning against a fiction.
+let httpRequests = 0;
+const countingFetch = (...args) => { httpRequests++; return fetch(...args); };
+
+const tally = { fetched: 0, gone: 0, failed: 0, unsupported: 0, empty: 0, writeMisses: 0 };
 const byAts = {};
 const reasons = {};
 let done = 0;
@@ -71,24 +79,32 @@ async function handle(row) {
   let result;
   try {
     result = await limiter.run(url, async () => {
-      const out = await fetchJd(url, { cache: boardCache });
+      const out = await fetchJd(url, { cache: boardCache, fetchImpl: countingFetch });
       // fetchJd reports throttling as a plain result; the limiter only learns
       // from a THROWN error carrying .status, so re-raise those two codes to
       // close the feedback loop that halves the window.
+      //
+      // `fromCache` guards it: a throttled ashby board is read by every job at
+      // that org, and re-raising the same one response per waiter would halve
+      // the window repeatedly and trip the circuit breaker over a single 429.
+      // Punish the limiter once, for the call that actually made the request.
       const m = /^http_(429|503)$/.exec(out.reason || '');
-      if (m) { const e = new Error(out.reason); e.status = Number(m[1]); throw e; }
+      if (m && !out.fromCache) { const e = new Error(out.reason); e.status = Number(m[1]); throw e; }
       return out;
     });
   } catch (e) {
     result = { ok: false, text: '', ats: null, reason: e?.circuitOpen ? 'circuit_open' : `http_${e?.status || 'error'}` };
   }
 
+  // Both writers return false when they matched no row. Ignoring that would let
+  // this script report a row fetched while the DB never changed — a summary
+  // that lies in the reassuring direction.
   if (result.ok) {
-    setJdText(db, url, result.text);
+    if (!setJdText(db, url, result.text)) tally.writeMisses++;
     tally.fetched++;
     byAts[result.ats] = (byAts[result.ats] || 0) + 1;
   } else {
-    markJdFailure(db, url, result.reason);
+    if (!markJdFailure(db, url, result.reason)) tally.writeMisses++;
     reasons[result.reason] = (reasons[result.reason] || 0) + 1;
     if (result.reason === 'gone') tally.gone++;
     else if (result.reason === 'unsupported') tally.unsupported++;
@@ -110,5 +126,10 @@ await Promise.all(Array.from({ length: Math.min(WORKERS, pending.length) }, asyn
 
 const chars = db.prepare("SELECT COALESCE(SUM(LENGTH(jd_text)), 0) n FROM jobs WHERE jd_status = 'ok'").get().n;
 const total = db.prepare("SELECT COUNT(*) n FROM jobs WHERE jd_status = 'ok'").get().n;
-const summary = { ...tally, byAts, reasons, adsInQueue: total, avgAdChars: total ? Math.round(chars / total) : 0, limiter: limiter.report() };
+const summary = {
+  ...tally, byAts, reasons,
+  rowsProcessed: done, httpRequests,
+  adsInQueue: total, avgAdChars: total ? Math.round(chars / total) : 0,
+  limiter: limiter.report(),
+};
 console.log(JSON.stringify(summary, null, 2));

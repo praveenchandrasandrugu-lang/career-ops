@@ -613,9 +613,22 @@ async function jdTextTests() {
     markJdFailure(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'gone', { now: NOW });
     const need = listNeedingJd(db, { now: NOW });
     T('listNeedingJd: a posting confirmed gone (404) is never re-requested', need.length === 1);
-    T('markJdFailure: the reason is recorded, not just the failure',
-      db.prepare('SELECT jd_status FROM jobs WHERE canonical_url = ?')
-        .get('https://job-boards.greenhouse.io/acme/jobs/1').jd_status === 'gone');
+    const failed = db.prepare('SELECT jd_status, jd_error FROM jobs WHERE canonical_url = ?')
+      .get('https://job-boards.greenhouse.io/acme/jobs/1');
+    T('markJdFailure: the bounded status is set', failed.jd_status === 'gone');
+    // The status is what gate logic branches on; the message is what makes an
+    // failure diagnosable without re-running the fetch. Assert both, or the
+    // test name ("the reason is recorded") claims more than it proves.
+    T('markJdFailure: the human-readable reason is recorded too', failed.jd_error === 'gone');
+  }
+
+  {
+    const db = await seed();
+    markJdFailure(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'http_403', { now: NOW });
+    const row = db.prepare('SELECT jd_status, jd_error FROM jobs WHERE canonical_url = ?')
+      .get('https://job-boards.greenhouse.io/acme/jobs/1');
+    T('markJdFailure: a non-gone reason maps to the bounded status error', row.jd_status === 'error');
+    T('markJdFailure: and keeps the specific cause', row.jd_error === 'http_403');
   }
 
   {

@@ -29,7 +29,12 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 // Workday: the careers page at /{site}/job/... is backed by /wday/cxs/{tenant}/{site}/job/...
 // The optional locale segment (/en-US/) belongs to the display URL only and is
 // not part of the CXS path, so it is matched and discarded.
-const WORKDAY_RE = /^https:\/\/([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Za-z]{2}\/)?([^/]+)(\/job\/.+)$/;
+// The optional locale is matched loosely (en, en-US, zh-Hans, pt-BR) because an
+// unmatched locale does not mis-parse the URL, it makes the posting
+// `unsupported` and drops it. A site slug is never locale-shaped in practice,
+// and where it could be ("/en/job/..."), the required trailing /job/ segment
+// forces the regex to backtrack and read it as the site.
+const WORKDAY_RE = /^https:\/\/([\w-]+)\.(wd[\w-]*)\.myworkdayjobs\.com\/(?:[a-z]{2,3}(?:-[A-Za-z]{2,8})?\/)?([^/]+)(\/job\/.+)$/;
 // Greenhouse serves the same board from two hosts, and the EU board is a
 // SEPARATE api host — pointing an EU board at the US api returns 404.
 const GREENHOUSE_RE = /^https:\/\/(?:job-boards|boards)(\.eu)?\.greenhouse\.io\/([^/]+)\/jobs\/(\d+)/;
@@ -89,17 +94,29 @@ const BLOCK_BOUNDARY = /<\/?(?:p|div|li|ul|ol|br|tr|h[1-6]|section|table)\b[^>]*
 /**
  * HTML (or entity-escaped HTML) to plain text, one line per block.
  *
- * Entities are decoded BEFORE tags are stripped because Greenhouse ships its ad
- * as entity-escaped markup inside a JSON string ("&lt;p&gt;"), where the tags
- * only exist after decoding. A second decode pass afterwards catches entities
- * that were inside the markup ("&amp;" between two tags).
+ * The order of decode-vs-strip is a real decision, not a detail. Greenhouse
+ * ships its ad as entity-escaped markup inside a JSON string ("&lt;p&gt;"), so
+ * its tags only exist after decoding. Every other ATS ships real HTML, where an
+ * escaped "&lt;" is CONTENT — "latency &lt; 100ms", "Map&lt;String, Integer&gt;".
+ *
+ * Doing both passes to every input (the original bug, caught in review) decoded
+ * that content into a real "<", which the tag stripper then ate along with
+ * everything up to the next ">": "Latency &lt; 100ms and availability &gt;
+ * 99.9%" became "Latency 99.9%". Requirement text deleted, no error raised.
+ *
+ * So the document type is decided ONCE, up front, and only then is a single
+ * strip-then-decode pass applied.
  *
  * @param {unknown} html
  * @returns {string}
  */
 export function htmlToText(html) {
   if (html == null) return '';
-  let s = decodeEntities(String(html));
+  let s = String(html);
+  // No real tags anywhere but escaped ones present => the whole document is
+  // escaped markup (the Greenhouse case). Unescape it once so it becomes the
+  // ordinary HTML the rest of this function expects.
+  if (!/<[a-zA-Z/!]/.test(s) && s.includes('&lt;')) s = decodeEntities(s);
   s = s.replace(DROP_SUBTREES, ' ');
   s = s.replace(BLOCK_BOUNDARY, '\n');
   s = s.replace(/<[^>]*>/g, '');
@@ -174,7 +191,7 @@ export function extractJdText(ats, payload, { url = '' } = {}) {
  */
 export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeoutMs = 20_000 } = {}) {
   const target = detailApiFor(jobUrl);
-  if (!target) return { ok: false, text: '', ats: null, reason: 'unsupported' };
+  if (!target) return { ok: false, text: '', ats: null, reason: 'unsupported', fromCache: false };
   const { ats, api, shared } = target;
   const cacheKey = shared && cache ? api : null;
 
@@ -185,9 +202,16 @@ export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeout
         signal: AbortSignal.timeout(timeoutMs),
       });
       if (!res.ok) {
-        // 404/410 is information, not a failure: the posting is gone. Conflating
-        // it with a transient error makes a dead row retry until it burns out.
-        return { error: res.status === 404 || res.status === 410 ? 'gone' : `http_${res.status}` };
+        // On a PER-JOB endpoint a 404/410 is information, not a failure: that
+        // posting is gone, and conflating it with a transient error makes a dead
+        // row retry until it burns out.
+        //
+        // On a SHARED endpoint it proves nothing about any individual posting —
+        // it is one failed board request, and a slug-mapping mistake or a single
+        // bad response would otherwise park every row at that org as permanently
+        // dead. Shared 404s stay retryable.
+        const dead = !shared && (res.status === 404 || res.status === 410);
+        return { error: dead ? 'gone' : `http_${res.status}` };
       }
       return { payload: await res.json() };
     } catch (e) {
@@ -200,16 +224,23 @@ export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeout
   // before either could have populated a value-cache — and a value-cache would
   // then fetch that board twice. Storing the in-flight promise is what makes
   // "one request per org" hold under concurrency.
+  // `fromCache` tells the caller this answer cost no request. It matters
+  // because the caller re-raises 429/503 to teach the adaptive limiter to back
+  // off: without the flag, every job waiting on one throttled board would
+  // re-raise that SAME response, halving the window repeatedly and tripping the
+  // circuit breaker against postings that never made a request.
   let outcome;
+  let fromCache = false;
   if (cacheKey) {
-    if (!cache.has(cacheKey)) cache.set(cacheKey, load());
+    if (cache.has(cacheKey)) fromCache = true;
+    else cache.set(cacheKey, load());
     outcome = await cache.get(cacheKey);
   } else {
     outcome = await load();
   }
-  if (outcome.error) return { ok: false, text: '', ats, reason: outcome.error };
+  if (outcome.error) return { ok: false, text: '', ats, reason: outcome.error, fromCache };
 
   const text = extractJdText(ats, outcome.payload, { url: jobUrl });
-  if (!text) return { ok: false, text: '', ats, reason: 'empty' };
-  return { ok: true, text, ats, reason: null };
+  if (!text) return { ok: false, text: '', ats, reason: 'empty', fromCache };
+  return { ok: true, text, ats, reason: null, fromCache };
 }

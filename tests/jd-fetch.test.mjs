@@ -220,3 +220,76 @@ eq('extractJdText: a payload missing its description field returns empty, not un
   eq('fetchJd: concurrent job A gets its own text', a.text, 'Job A');
   eq('fetchJd: concurrent job B gets its own text', b.text, 'Job B');
 }
+
+// ── Codex review 2026-07-21: confirmed defects, each pinned before the fix ──
+
+// The worst of them. Decoding entities BEFORE stripping tags turned an ESCAPED
+// comparison operator into a real one, and the tag stripper then ate everything
+// up to the next '>'. "<p>Latency &lt; 100ms and availability &gt; 99.9%</p>"
+// came out as "Latency 99.9%" — requirement text deleted with no error. It is
+// exactly the silent-loss failure this pipeline refuses.
+//
+// Greenhouse needs decode-before-strip (its whole ad is escaped). Every other
+// ATS needs strip-before-decode. Applying both passes to every input was the bug.
+eq('htmlToText: keeps an escaped < in real HTML instead of eating the text after it',
+  htmlToText('<p>Latency &lt; 100ms and availability &gt; 99.9%</p>'),
+  'Latency < 100ms and availability > 99.9%');
+eq('htmlToText: keeps generic type syntax (Map<String, Integer>)',
+  htmlToText('<li>Use Map&lt;String, Integer&gt; daily</li>'),
+  'Use Map<String, Integer> daily');
+eq('htmlToText: still unescapes a fully escaped greenhouse ad (the other case)',
+  htmlToText('&lt;ul&gt;&lt;li&gt;Own the pipeline&lt;/li&gt;&lt;/ul&gt;'),
+  'Own the pipeline');
+eq('htmlToText: an escaped ad containing a double-escaped operator keeps the operator',
+  htmlToText('&lt;p&gt;Uptime &amp;gt; 99%&lt;/p&gt;'), 'Uptime > 99%');
+
+// A 404 on a SHARED endpoint is not evidence about one posting — it is one
+// failed board request. Treating it as terminal 'gone' would park every row at
+// that org permanently on a single bad response or a slug-mapping mistake.
+{
+  const fakeFetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  const shared = await fetchJd('https://jobs.ashbyhq.com/acme/uuid-1', { fetchImpl: fakeFetch, cache: new Map() });
+  eq('fetchJd: a 404 on a shared board endpoint is retryable, NOT terminal gone', shared.reason, 'http_404');
+  const perJob = await fetchJd('https://job-boards.greenhouse.io/acme/jobs/1', { fetchImpl: fakeFetch });
+  eq('fetchJd: a 404 on a per-job endpoint is still terminal gone', perJob.reason, 'gone');
+}
+
+// The caller re-raises 429/503 so the adaptive limiter can halve its window.
+// With a cached board error, every waiter at that org would re-raise the SAME
+// one response, halving the window repeatedly and tripping the circuit breaker
+// against jobs that never made a request. The caller needs to know the answer
+// came from cache so it punishes the limiter once, not N times.
+{
+  let hits = 0;
+  const fakeFetch = async () => { hits++; return { ok: false, status: 429, json: async () => ({}) }; };
+  const cache = new Map();
+  const a = await fetchJd('https://jobs.ashbyhq.com/acme/j1', { fetchImpl: fakeFetch, cache });
+  const b = await fetchJd('https://jobs.ashbyhq.com/acme/j2', { fetchImpl: fakeFetch, cache });
+  eq('fetchJd: a throttled board is requested once, not once per waiting job', hits, 1);
+  eq('fetchJd: the caller that actually made the request is not marked fromCache', a.fromCache, false);
+  eq('fetchJd: every later waiter IS marked fromCache (so the limiter is punished once)', b.fromCache, true);
+}
+
+{
+  const fakeFetch = async () => ({ ok: true, status: 200, json: async () => ({ content: 'An ad' }) });
+  const r = await fetchJd('https://job-boards.greenhouse.io/acme/jobs/1', { fetchImpl: fakeFetch });
+  eq('fetchJd: a fresh per-job success is never fromCache', r.fromCache, false);
+}
+
+// Workday locale segments are display-only. /en-US/ was handled; /en/ and
+// /zh-Hans/ were not, and an unmatched locale makes the whole posting
+// unsupported rather than merely mis-parsed.
+eq('detailApiFor: workday /en-US/ locale segment is dropped from the CXS path',
+  detailApiFor('https://acme.wd1.myworkdayjobs.com/en-US/careers/job/NY/Analyst_R1')?.api,
+  'https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/careers/job/NY/Analyst_R1');
+eq('detailApiFor: a bare /en/ locale segment is dropped too',
+  detailApiFor('https://acme.wd1.myworkdayjobs.com/en/careers/job/NY/Analyst_R1')?.api,
+  'https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/careers/job/NY/Analyst_R1');
+eq('detailApiFor: a script-subtag locale (zh-Hans) is dropped too',
+  detailApiFor('https://acme.wd1.myworkdayjobs.com/zh-Hans/careers/job/NY/Analyst_R1')?.api,
+  'https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/careers/job/NY/Analyst_R1');
+// The site slug is NOT a locale, and mistaking it for one would drop the real
+// site and build a broken endpoint.
+eq('detailApiFor: a non-locale first segment is treated as the site, not a locale',
+  detailApiFor('https://acme.wd1.myworkdayjobs.com/careers/job/NY/Analyst_R1')?.api,
+  'https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/careers/job/NY/Analyst_R1');
