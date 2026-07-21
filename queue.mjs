@@ -122,8 +122,67 @@ export async function openQueue(path = process.env.CAREER_OPS_QUEUE_DB || 'data/
     // now belongs to someone else, silently discarding the new worker's result.
     // Every transition out of a claim must present the token it was issued.
     claim_token: 'TEXT',
+    // The job ad itself. Until this column existed the queue stored pointers
+    // (url/title/company) and verdicts (everify_status, level_status) but never
+    // the EVIDENCE, so no gate could read a requirement and nothing could be
+    // scored. jd_status is bounded ('none'|'ok'|'gone'|'error') because gate
+    // logic branches on it; the human-readable cause lives in jd_error, so an
+    // 'error' row can be diagnosed without re-running the fetch.
+    jd_text: 'TEXT',
+    jd_status: "TEXT NOT NULL DEFAULT 'none'",
+    jd_fetched_at: 'INTEGER',
+    jd_error: 'TEXT',
   });
   return db;
+}
+
+// ── the job ad (jd_text) ────────────────────────────────────────────────────
+
+/**
+ * Store the fetched ad for one posting.
+ * @returns {boolean} true when the row existed (false means the URL is unknown,
+ *   which is a caller bug worth surfacing rather than a silent no-op)
+ */
+export function setJdText(db, canonicalUrl, text, { now = Date.now() } = {}) {
+  return db.prepare(`
+    UPDATE jobs SET jd_text = ?, jd_status = 'ok', jd_fetched_at = ?, jd_error = NULL
+    WHERE canonical_url = ?
+  `).run(String(text ?? ''), now, canonicalUrl).changes === 1;
+}
+
+/**
+ * Record that the ad could not be fetched.
+ *
+ * The distinction the reason encodes is the whole point: a posting confirmed
+ * GONE (404/410) must never be requested again, while a timeout or 5xx must be,
+ * because dropping a job over one bad network moment is the one outcome this
+ * pipeline refuses. Anything not 'gone' therefore stays in the retry pool.
+ *
+ * @returns {boolean} true when the row existed
+ */
+export function markJdFailure(db, canonicalUrl, reason, { now = Date.now() } = {}) {
+  const status = reason === 'gone' ? 'gone' : 'error';
+  return db.prepare(`
+    UPDATE jobs SET jd_status = ?, jd_error = ?, jd_fetched_at = ?
+    WHERE canonical_url = ?
+  `).run(status, String(reason ?? ''), now, canonicalUrl).changes === 1;
+}
+
+/**
+ * Gate-passed rows still missing their ad, in the same drain order the LLM uses
+ * (freshest first), so a partial run always fetches the ads that matter most.
+ *
+ * Only `llm_ready` rows are returned: a row the gate already rejected does not
+ * deserve a network request.
+ *
+ * @returns {Array<object>}
+ */
+export function listNeedingJd(db, { now = Date.now(), limit = Infinity } = {}) {
+  // Filter AFTER ordering, then slice — limiting inside listReady would count
+  // already-fetched rows against the budget and silently under-return.
+  return listReady(db, { now })
+    .filter((r) => r.jd_status !== 'ok' && r.jd_status !== 'gone')
+    .slice(0, limit);
 }
 
 /**

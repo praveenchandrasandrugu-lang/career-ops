@@ -1,0 +1,222 @@
+/**
+ * jd-fetch.test.mjs — the job-ad text fetcher (jd-fetch.mjs).
+ *
+ * The queue has always stored pointers (url/company/title) and verdicts
+ * (everify_status, level_status) but never the EVIDENCE: no row has ever held
+ * the job ad itself. That is why the funnel stops dead at llm_ready — every
+ * gate so far could only look at metadata. This module is the missing step:
+ * turn a posting URL into its plain-text job description, at zero token cost,
+ * using the same JSON endpoints the careers pages themselves call.
+ *
+ * Four ATSs cover 97% of the queue (workday 1819, greenhouse 258, ashby 199,
+ * lever 106). Every fixture below is shaped from a LIVE probe of that ATS on
+ * 2026-07-21, not from memory — a fixture that invents field names would make
+ * these tests pass while the fetcher returns nothing in production.
+ *
+ * Two shapes drive the design and are pinned here:
+ *   - Ashby has NO per-job endpoint. Its public API returns the whole board,
+ *     descriptions included, so cost is one request per ORG, not per job.
+ *   - Lever splits the ad: descriptionPlain is only the intro, and the actual
+ *     requirements live in lists[].content. Reading one field silently drops
+ *     the exact text a skill screen needs.
+ *
+ * Run: node tests/jd-fetch.test.mjs  (or via test-all.mjs)
+ */
+import { pass, fail } from './helpers.mjs';
+import { detailApiFor, htmlToText, extractJdText, fetchJd } from '../jd-fetch.mjs';
+
+const T = (label, cond) => (cond ? pass(label) : fail(label));
+const eq = (label, got, want) => T(`${label}${got === want ? '' : ` (got ${JSON.stringify(got)})`}`, got === want);
+const has = (label, got, needle) => T(`${label}${String(got).includes(needle) ? '' : ` (got ${JSON.stringify(String(got).slice(0, 120))})`}`, String(got).includes(needle));
+
+// ── detailApiFor: posting URL → the JSON endpoint that holds the ad ─────────
+
+eq('detailApiFor: workday job URL maps to its CXS detail endpoint',
+  detailApiFor('https://wf.wd1.myworkdayjobs.com/wellsfargojobs/job/JAMESTOWN-ND/Branch-Ops_R-559821')?.api,
+  'https://wf.wd1.myworkdayjobs.com/wday/cxs/wf/wellsfargojobs/job/JAMESTOWN-ND/Branch-Ops_R-559821');
+eq('detailApiFor: workday board root (no /job/ segment) is not a posting',
+  detailApiFor('https://wf.wd1.myworkdayjobs.com/wellsfargojobs'), null);
+
+eq('detailApiFor: greenhouse job URL maps to boards-api',
+  detailApiFor('https://job-boards.greenhouse.io/kargo/jobs/6120133004')?.api,
+  'https://boards-api.greenhouse.io/v1/boards/kargo/jobs/6120133004');
+eq('detailApiFor: greenhouse EU board keeps the EU api host (a US host 404s)',
+  detailApiFor('https://job-boards.eu.greenhouse.io/acme/jobs/42')?.api,
+  'https://boards-api.eu.greenhouse.io/v1/boards/acme/jobs/42');
+
+eq('detailApiFor: lever job URL maps to the v0 postings endpoint',
+  detailApiFor('https://jobs.lever.co/zoox/d4108968-e83d-4d87-a92c-e4cd1823801c')?.api,
+  'https://api.lever.co/v0/postings/zoox/d4108968-e83d-4d87-a92c-e4cd1823801c');
+
+// Ashby's endpoint is the ORG's whole board, so it is shared by every posting
+// at that org. `shared` is what lets the caller fetch it once for all 199 rows.
+eq('detailApiFor: ashby job URL maps to its org board',
+  detailApiFor('https://jobs.ashbyhq.com/openai/596e543a-0ab9-471e-a1ff-40fd55c74fce')?.api,
+  'https://api.ashbyhq.com/posting-api/job-board/openai');
+eq('detailApiFor: ashby endpoint is marked shared (one board serves every job at that org)',
+  detailApiFor('https://jobs.ashbyhq.com/openai/596e543a')?.shared, true);
+eq('detailApiFor: a per-job endpoint is NOT shared',
+  detailApiFor('https://job-boards.greenhouse.io/kargo/jobs/6120133004')?.shared, false);
+
+eq('detailApiFor: an unrecognized careers site returns null (no endpoint to guess)',
+  detailApiFor('https://www.compass.com/careers/some-role'), null);
+eq('detailApiFor: junk input returns null instead of throwing',
+  detailApiFor('not a url'), null);
+
+// ── htmlToText: ATS ads are HTML; screening reads sentences ────────────────
+
+eq('htmlToText: strips tags and decodes entities',
+  htmlToText('<p>Python &amp; SQL</p>'), 'Python & SQL');
+
+// Requirements arrive as <li> bullets. Without a line break they concatenate
+// into "5 years of PythonBachelor degree", which reads as one bogus sentence
+// and corrupts any downstream requirement parse.
+T('htmlToText: list items become separate lines, never one run-on sentence',
+  htmlToText('<ul><li>5 years of Python</li><li>Bachelor degree</li></ul>').split('\n').filter(Boolean).length === 2);
+
+// Greenhouse serves its ad as ENTITY-ESCAPED html inside a JSON string, so the
+// tags only appear after decoding. Stripping before decoding leaves literal
+// "<p>" in the output.
+eq('htmlToText: handles greenhouse entity-escaped markup (decode before strip)',
+  htmlToText('&lt;p&gt;Own the data pipeline&lt;/p&gt;'), 'Own the data pipeline');
+
+eq('htmlToText: null/undefined input returns an empty string', htmlToText(null), '');
+
+// ── extractJdText: pull the ad out of each ATS's own payload shape ──────────
+
+eq('extractJdText: workday reads jobPostingInfo.jobDescription',
+  extractJdText('workday', { jobPostingInfo: { jobDescription: '<p>Branch Operations</p>' } }),
+  'Branch Operations');
+
+eq('extractJdText: greenhouse reads content',
+  extractJdText('greenhouse', { content: '&lt;p&gt;Kargo is hiring&lt;/p&gt;' }),
+  'Kargo is hiring');
+
+// The lists are the requirements. A fetcher that returns only descriptionPlain
+// looks like it worked and silently drops the part screening depends on.
+{
+  const lever = {
+    descriptionPlain: 'About Zoox',
+    lists: [{ text: 'Requirements', content: '<ul><li>5 years of Python</li></ul>' }],
+    additionalPlain: 'Zoox is an equal opportunity employer',
+  };
+  const got = extractJdText('lever', lever);
+  has('extractJdText: lever keeps the intro', got, 'About Zoox');
+  has('extractJdText: lever keeps the lists[] requirements (not just descriptionPlain)', got, '5 years of Python');
+  has('extractJdText: lever keeps the additional section', got, 'equal opportunity');
+}
+
+// Ashby hands back the whole board, so the right job has to be picked out of
+// it. Matching on the job id from the URL is the only stable key: jobUrl in the
+// payload can carry tracking params the queue's canonical URL has stripped.
+{
+  const board = {
+    jobs: [
+      { id: 'aaa', jobUrl: 'https://jobs.ashbyhq.com/openai/aaa', descriptionPlain: 'Wrong job' },
+      { id: '596e543a', jobUrl: 'https://jobs.ashbyhq.com/openai/596e543a', descriptionPlain: 'Research Engineer, Alignment' },
+    ],
+  };
+  eq('extractJdText: ashby picks the posting matching the job id in the URL',
+    extractJdText('ashby', board, { url: 'https://jobs.ashbyhq.com/openai/596e543a' }),
+    'Research Engineer, Alignment');
+  eq('extractJdText: ashby returns empty when the board no longer lists that job',
+    extractJdText('ashby', board, { url: 'https://jobs.ashbyhq.com/openai/deleted-id' }), '');
+}
+
+eq('extractJdText: a payload missing its description field returns empty, not undefined',
+  extractJdText('workday', {}), '');
+
+// ── fetchJd: the network step, with fetch injected so tests stay offline ────
+
+{
+  const calls = [];
+  const fakeFetch = async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => ({ jobPostingInfo: { jobDescription: '<p>Hello</p>' } }) };
+  };
+  const r = await fetchJd('https://wf.wd1.myworkdayjobs.com/site/job/ND/Role_R-1', { fetchImpl: fakeFetch });
+  eq('fetchJd: returns the extracted text on 200', r.text, 'Hello');
+  eq('fetchJd: reports the ats it used', r.ats, 'workday');
+  eq('fetchJd: succeeds', r.ok, true);
+}
+
+// A 404 is real information: the posting is gone. It must be distinguishable
+// from a transient failure, or a dead job gets retried forever.
+{
+  const fakeFetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  const r = await fetchJd('https://jobs.lever.co/acme/uuid-1', { fetchImpl: fakeFetch });
+  eq('fetchJd: a 404 is reported as gone, not as a transient error', r.reason, 'gone');
+  eq('fetchJd: a 404 does not succeed', r.ok, false);
+}
+
+{
+  const fakeFetch = async () => ({ ok: false, status: 503, json: async () => ({}) });
+  const r = await fetchJd('https://jobs.lever.co/acme/uuid-1', { fetchImpl: fakeFetch });
+  eq('fetchJd: a 5xx is reported as a retryable http error, not as gone', r.reason, 'http_503');
+}
+
+{
+  const fakeFetch = async () => { throw new Error('boom'); };
+  const r = await fetchJd('https://jobs.lever.co/acme/uuid-1', { fetchImpl: fakeFetch });
+  eq('fetchJd: a thrown network error is caught, not propagated', r.ok, false);
+  has('fetchJd: the network error reason names the failure', r.reason, 'boom');
+}
+
+{
+  const r = await fetchJd('https://www.compass.com/careers/role', { fetchImpl: async () => { throw new Error('should not be called'); } });
+  eq('fetchJd: an unsupported site is skipped without a request', r.reason, 'unsupported');
+}
+
+// The whole point of the shared-board design: 129 Ashby orgs, not 199 requests.
+{
+  let hits = 0;
+  const board = { jobs: [{ id: 'a1', jobUrl: 'https://jobs.ashbyhq.com/openai/a1', descriptionPlain: 'Job A' },
+                         { id: 'b2', jobUrl: 'https://jobs.ashbyhq.com/openai/b2', descriptionPlain: 'Job B' }] };
+  const fakeFetch = async () => { hits++; return { ok: true, status: 200, json: async () => board }; };
+  const cache = new Map();
+  const a = await fetchJd('https://jobs.ashbyhq.com/openai/a1', { fetchImpl: fakeFetch, cache });
+  const b = await fetchJd('https://jobs.ashbyhq.com/openai/b2', { fetchImpl: fakeFetch, cache });
+  eq('fetchJd: two jobs at one ashby org cost ONE board request', hits, 1);
+  eq('fetchJd: the first ashby job still gets its own text', a.text, 'Job A');
+  eq('fetchJd: the second ashby job gets ITS text, not the cached first one', b.text, 'Job B');
+}
+
+// A per-job endpoint must NOT be cached across different jobs — that would
+// hand every posting the first one's description.
+{
+  let hits = 0;
+  const fakeFetch = async (url) => {
+    hits++;
+    return { ok: true, status: 200, json: async () => ({ content: url.endsWith('/1') ? 'First ad' : 'Second ad' }) };
+  };
+  const cache = new Map();
+  const a = await fetchJd('https://job-boards.greenhouse.io/acme/jobs/1', { fetchImpl: fakeFetch, cache });
+  const b = await fetchJd('https://job-boards.greenhouse.io/acme/jobs/2', { fetchImpl: fakeFetch, cache });
+  eq('fetchJd: two greenhouse jobs each cost their own request', hits, 2);
+  eq('fetchJd: greenhouse job 2 gets its own ad, not job 1 cached', b.text, 'Second ad');
+  eq('fetchJd: greenhouse job 1 is unaffected', a.text, 'First ad');
+}
+
+// Concurrency, not just repetition. The drain runs several fetches at once, so
+// two jobs at the same ashby org can be in flight BEFORE either has populated
+// the cache. Caching the resolved value only helps the second caller if it
+// arrives late; caching the PROMISE is what makes the dedup hold under
+// concurrency (the same lesson capexempt-screen.mjs learned with its model load).
+{
+  let hits = 0;
+  const board = { jobs: [{ id: 'a1', jobUrl: 'https://jobs.ashbyhq.com/openai/a1', descriptionPlain: 'Job A' },
+                         { id: 'b2', jobUrl: 'https://jobs.ashbyhq.com/openai/b2', descriptionPlain: 'Job B' }] };
+  const fakeFetch = async () => {
+    hits++;
+    await new Promise((r) => setTimeout(r, 10)); // a real request is not instant
+    return { ok: true, status: 200, json: async () => board };
+  };
+  const cache = new Map();
+  const [a, b] = await Promise.all([
+    fetchJd('https://jobs.ashbyhq.com/openai/a1', { fetchImpl: fakeFetch, cache }),
+    fetchJd('https://jobs.ashbyhq.com/openai/b2', { fetchImpl: fakeFetch, cache }),
+  ]);
+  eq('fetchJd: two CONCURRENT jobs at one ashby org still cost one board request', hits, 1);
+  eq('fetchJd: concurrent job A gets its own text', a.text, 'Job A');
+  eq('fetchJd: concurrent job B gets its own text', b.text, 'Job B');
+}

@@ -20,7 +20,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { pass, fail, ROOT } from './helpers.mjs';
 import { pathToFileURL } from 'url';
-import { canonicalizeUrl, openQueue, upsertJobs, listReady, allUrls } from '../queue.mjs';
+import { canonicalizeUrl, openQueue, upsertJobs, listReady, allUrls, setJdText, markJdFailure, listNeedingJd } from '../queue.mjs';
 
 const DAY = 86_400_000;
 const NOW = 1_700_000_000_000; // fixed reference so tests are deterministic
@@ -541,3 +541,102 @@ async function fencingTests() {
 }
 
 await fencingTests();
+
+// ── the job ad itself (jd_text) ─────────────────────────────────────────────
+//
+// Until now the queue stored pointers and verdicts but never the EVIDENCE: no
+// row held the job ad, so no gate could read one and nothing could be scored.
+// These pin the storage half of that fix (jd-fetch.mjs is the network half).
+//
+// The load-bearing rule is which rows come back for a retry. A dead posting
+// (404) must never be re-requested — 2,446 rows re-hitting dead URLs every run
+// is the kind of waste that looks like progress. A timeout must be retried,
+// because dropping a job on one bad network moment is the one outcome this
+// pipeline refuses.
+async function jdTextTests() {
+  console.log('\nJob-ad storage (jd_text)');
+  const dir = mkdtempSync(join(tmpdir(), 'queue-jd-'));
+  const dbPath = join(dir, 'q.db');
+
+  // Windows will not delete a file that still has an open handle, so every DB
+  // opened here is tracked and closed before the temp dir is removed.
+  const open = [];
+  const seed = async () => {
+    const db = await openQueue(dbPath);
+    open.push(db);
+    db.prepare('DELETE FROM jobs').run();
+    upsertJobs(db, [
+      { url: 'https://job-boards.greenhouse.io/acme/jobs/1', title: 'Hot role', postedAt: NOW, confidence: 'exact' },
+      { url: 'https://job-boards.greenhouse.io/acme/jobs/2', title: 'Older role', postedAt: NOW - 2 * DAY, confidence: 'exact' },
+    ], { now: NOW });
+    db.prepare("UPDATE jobs SET queue_status='llm_ready'").run();
+    return db;
+  };
+
+  const cols = async () => {
+    const db = await openQueue(dbPath);
+    open.push(db);
+    return new Set(db.prepare('PRAGMA table_info(jobs)').all().map((c) => c.name));
+  };
+
+  const c = await cols();
+  T('migration: jd_text column exists', c.has('jd_text'));
+  T('migration: jd_status column exists', c.has('jd_status'));
+  T('migration: jd_fetched_at column exists', c.has('jd_fetched_at'));
+
+  {
+    const db = await seed();
+    T('setJdText: stores the ad and reports it owned the row',
+      setJdText(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'We need Python and SQL', { now: NOW }) === true);
+    const row = db.prepare('SELECT * FROM jobs WHERE canonical_url = ?').get('https://job-boards.greenhouse.io/acme/jobs/1');
+    T('setJdText: the text is readable back', row.jd_text === 'We need Python and SQL');
+    T('setJdText: marks the row fetched', row.jd_status === 'ok');
+    T('setJdText: records when it was fetched', row.jd_fetched_at === NOW);
+    T('setJdText: an unknown URL reports false instead of silently doing nothing',
+      setJdText(db, 'https://job-boards.greenhouse.io/acme/jobs/999', 'x', { now: NOW }) === false);
+  }
+
+  {
+    const db = await seed();
+    const need = listNeedingJd(db, { now: NOW });
+    T('listNeedingJd: returns every llm_ready row with no ad yet', need.length === 2);
+    T('listNeedingJd: freshest first (same drain order as the LLM)', need[0].title === 'Hot role');
+
+    setJdText(db, need[0].canonical_url, 'some ad text', { now: NOW });
+    const after = listNeedingJd(db, { now: NOW });
+    T('listNeedingJd: a row already fetched is not requested again', after.length === 1);
+    T('listNeedingJd: and the one left is the one still missing its ad', after[0].title === 'Older role');
+  }
+
+  {
+    const db = await seed();
+    markJdFailure(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'gone', { now: NOW });
+    const need = listNeedingJd(db, { now: NOW });
+    T('listNeedingJd: a posting confirmed gone (404) is never re-requested', need.length === 1);
+    T('markJdFailure: the reason is recorded, not just the failure',
+      db.prepare('SELECT jd_status FROM jobs WHERE canonical_url = ?')
+        .get('https://job-boards.greenhouse.io/acme/jobs/1').jd_status === 'gone');
+  }
+
+  {
+    const db = await seed();
+    markJdFailure(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'network: timeout', { now: NOW });
+    T('listNeedingJd: a transient failure IS retried (a timeout must not lose a job)',
+      listNeedingJd(db, { now: NOW }).length === 2);
+  }
+
+  // A re-scan refreshes title/date. It must not throw away an ad already paid for.
+  {
+    const db = await seed();
+    setJdText(db, 'https://job-boards.greenhouse.io/acme/jobs/1', 'the ad', { now: NOW });
+    upsertJobs(db, [{ url: 'https://job-boards.greenhouse.io/acme/jobs/1', title: 'Hot role (updated)', postedAt: NOW, confidence: 'exact' }], { now: NOW + DAY });
+    const row = db.prepare('SELECT * FROM jobs WHERE canonical_url = ?').get('https://job-boards.greenhouse.io/acme/jobs/1');
+    T('upsertJobs: a re-scan updates the title', row.title === 'Hot role (updated)');
+    T('upsertJobs: a re-scan does NOT wipe an ad already fetched', row.jd_text === 'the ad');
+  }
+
+  for (const db of open) { try { db.close(); } catch { /* already closed */ } }
+  rmSync(dir, { recursive: true, force: true });
+}
+
+await jdTextTests();
