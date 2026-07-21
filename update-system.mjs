@@ -163,6 +163,8 @@ const SYSTEM_PATHS = [
   'gate.mjs',
   'jd-fetch.mjs',
   'fetch-jds.mjs',
+  'screen-jd.mjs',
+  'screen-queue.mjs',
   'everify-check.mjs',
   'adaptive-limiter.mjs',
   'capexempt-live.mjs',
