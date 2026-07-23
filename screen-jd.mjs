@@ -6,11 +6,12 @@
  * a title, a company and a URL. This module reads the ad and drops the postings
  * that are plainly ineligible, so a model is only ever paid for the rest.
  *
- * The gates are not invented here. `modes/_custom.md` names exactly four hard
- * gates — citizenship / clearance / permanent-authorization demands, a
- * graduation-cohort window the candidate fails, an experience bar he does not
- * clear, and a terminated E-Verify employer. The first three are readable from
- * the ad text; the fourth already runs in `everify-check.mjs`.
+ * The gates are not invented here. `modes/_custom.md` names the hard gates —
+ * citizenship / clearance / permanent-authorization demands, a graduation-cohort
+ * window the candidate fails, a licensed certification, and a terminated E-Verify
+ * employer (the last runs in `everify-check.mjs`). The experience bar USED to be
+ * a hard gate too; as of 2026-07-23 it only quarantines (see screenJd's doctrine
+ * note), because a bar is inflatable and 15% of good postings carry one.
  *
  * THE ASYMMETRY THAT SETS EVERY THRESHOLD BELOW: a false positive silently
  * deletes a job the candidate should have seen, and he never learns what he
@@ -28,8 +29,24 @@
  * kept them as CLI-internal constants.
  */
 
-// "5+ years", "3-5 years", "minimum of 2 years", "at least 4 years".
-const YOE_RE = /(?:\b(?:at least|minimum of|a minimum of)\s+)?\b(\d+)\s*(?:\+|\s*-\s*\d+|\s+or\s+more)?\s*years?\b[^.;•\n]{0,120}/gi;
+// Numbers are spelled out as often as they are typed. Measured on real ads,
+// the single most common bar screen-jd USED to miss was the written-out form:
+// "Six or more years", "a minimum of four years". Ordered longest-first so the
+// alternation prefers "fourteen" over "four" at the same position.
+const NUM_WORD = {
+  fifteen: 15, fourteen: 14, thirteen: 13, twelve: 12, eleven: 11, ten: 10,
+  nine: 9, eight: 8, seven: 7, six: 6, five: 5, four: 4, three: 3, two: 2, one: 1,
+};
+const NUM_SRC = ['\\d+', ...Object.keys(NUM_WORD)].join('|');
+
+// "5+ years", "3-5 years", "minimum of 2 years", "at least four years",
+// "Six or more years".
+const YOE_RE = new RegExp(
+  `(?:\\b(?:at least|minimum of|a minimum of)\\s+)?\\b(${NUM_SRC})\\s*(?:\\+|\\s*-\\s*\\d+|\\s+or\\s+more)?\\s*years?\\b[^.;•\\n]{0,120}`,
+  'gi',
+);
+// A captured token is either digits or one of the spelled-out words above.
+const toYears = (token) => NUM_WORD[String(token).toLowerCase()] ?? Number(token);
 
 // A years bar with an alternative route is not a bar. Target #017 (4.4) was
 // viable on exactly this clause while Target FP&A (3.8), same number of years
@@ -130,7 +147,7 @@ export function findExperienceBar(jdText) {
   let minYears = null;
   let evidence = null;
   for (const m of text.matchAll(YOE_RE)) {
-    const n = Number(m[1]);
+    const n = toYears(m[1]);
     if (!Number.isFinite(n) || n > MAX_PLAUSIBLE_YEARS) continue;
     const span = m[0];
     if (AGE_RULE_RE.test(span)) continue;
@@ -183,14 +200,23 @@ export function findNamedCertGate(jdText) {
   return { gated: true, evidence: sentence };
 }
 
-// A bar at or above this many years, with no alternative route offered, is
-// treated as unreachable. Set from recorded outcomes, not taste: 5+ drove the
-// Anthropic (2.7) and Boomi (3.4) rejections, while 3-year roles have been
-// cleared. Anything in between is surfaced as a stretch rather than deleted.
-const HARD_YEARS = 5;
+// A stated bar at or above this many years is surfaced as a stretch. It is NOT
+// a drop: see the doctrine note on screenJd. Set from recorded outcomes, not
+// taste — 3-year roles have been cleared, so anything under this reads as clear.
+const STRETCH_YEARS = 3;
 
 /**
  * The combined verdict for one ad.
+ *
+ * DOCTRINE (changed 2026-07-23, Codex review + measured lift): an experience
+ * bar QUARANTINES a job, it never drops it. Two measured facts force this: 15%
+ * of good postings (score >=3.5) still cite a failing bar, and years
+ * requirements are routinely inflated, negotiable, or met by internships and
+ * graduate work. So a bar becomes a 'stretch' (kept, flagged), never 'gated'.
+ * Only a wall the candidate cannot cross by being hired still gates:
+ * citizenship / permanent-authorization, a graduation cohort he has missed, or
+ * a licensed certification. The experience bar was the last non-absolute gate
+ * and it has been removed from the drop path.
  *
  * @param {unknown} jdText
  * @returns {{verdict:'clear'|'stretch'|'gated'|'unknown', reasons:Array<{gate:string, evidence:string|null}>}}
@@ -210,14 +236,12 @@ export function screenJd(jdText) {
   const cert = findNamedCertGate(text);
   if (cert.gated) reasons.push({ gate: 'named_certification', evidence: cert.evidence });
 
-  const bar = findExperienceBar(text);
-  const barBlocks = bar.minYears !== null && bar.minYears >= HARD_YEARS && !bar.hasEscapeHatch;
-  if (barBlocks) reasons.push({ gate: 'experience_bar', evidence: bar.evidence });
-
   if (reasons.length) return { verdict: 'gated', reasons };
-  // The escape hatch decides gated-vs-not; the NUMBER alone decides
-  // clear-vs-stretch. Answering a 5-year ad on an equivalency clause is still
-  // stretching, and calling it "clear" would overstate the fit.
-  if (bar.minYears !== null && bar.minYears >= 3) return { verdict: 'stretch', reasons: [] };
+
+  // No hard wall fired. The experience bar can only downgrade clear -> stretch,
+  // never drop. The escape hatch is irrelevant to that call now that a bar is
+  // never a drop; the stated NUMBER alone decides whether the fit is a stretch.
+  const bar = findExperienceBar(text);
+  if (bar.minYears !== null && bar.minYears >= STRETCH_YEARS) return { verdict: 'stretch', reasons: [] };
   return { verdict: 'clear', reasons: [] };
 }

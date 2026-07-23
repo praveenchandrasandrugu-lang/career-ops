@@ -40,6 +40,22 @@ eq('findExperienceBar: takes the LOWEST bar when an ad states several',
 eq('findExperienceBar: an ad with no stated bar reports null, never 0',
   findExperienceBar('You will own the data platform.').minYears, null);
 
+// ── written-out numbers (the 127-job leak) ─────────────────────────────────
+// YOE_RE only captured \d+, so "six years" and "Six or more years" sailed
+// through as clear. Measured on real ads: 30.8% of level_status='clear' rows
+// carried a bar screen-jd missed, 127 of them above the candidate's 2.3 years.
+// The single most common miss was the number spelled out.
+eq('findExperienceBar: reads a WRITTEN-OUT number ("six years of experience")',
+  findExperienceBar('We need six years of backend experience.').minYears, 6);
+eq('findExperienceBar: reads "Six or more years"',
+  findExperienceBar('Six or more years of relevant experience required.').minYears, 6);
+eq('findExperienceBar: reads "a minimum of four years"',
+  findExperienceBar('A minimum of four years in analytics is required.').minYears, 4);
+eq('findExperienceBar: a written-out bar under three years still parses',
+  findExperienceBar('Two years of experience with dashboards.').minYears, 2);
+eq('findExperienceBar: "one year" is not confused with a larger word-number',
+  findExperienceBar('One year of relevant experience required.').minYears, 1);
+
 // Target #017 (scored 4.4) was viable precisely because of this clause, while
 // Target FP&A (3.8) was not — same number of years, opposite outcome. Missing
 // the escape hatch would throw away the better of the two jobs.
@@ -115,8 +131,21 @@ T('findNamedCertGate: a certification obtainable after hire is not a bar',
 
 eq('screenJd: a wide-open ad is clear',
   screenJd('Join our team building data pipelines. Bachelor degree preferred.').verdict, 'clear');
-eq('screenJd: a 5-year bar with no escape hatch is gated',
-  screenJd('Requires 5+ years of production engineering.').verdict, 'gated');
+
+// DOCTRINE CHANGE 2026-07-23 (Codex review + measured lift). An experience bar
+// is NEVER a hard drop. It quarantines the job (verdict 'stretch', kept and
+// flagged), it does not delete it. Two facts force this: 15% of GOOD jobs
+// (score >=3.5) still cite a failing bar, and years requirements are routinely
+// inflated, negotiable, or met by internships / graduate work. A wrong drop is
+// invisible damage. Only a legally/administratively absolute wall
+// (citizenship, permanent-authorization, graduation cohort, licensed cert)
+// still gates. The experience bar was the last non-absolute gate; it is gone.
+eq('screenJd: a 5-year bar with no escape hatch is a STRETCH, not a drop (quarantine doctrine)',
+  screenJd('Requires 5+ years of production engineering.').verdict, 'stretch');
+eq('screenJd: even a 10-year bar quarantines rather than dropping',
+  screenJd('Requires 10+ years of engineering leadership.').verdict, 'stretch');
+eq('screenJd: a written-out five-year bar also quarantines, not clear, not gated',
+  screenJd('We require five years of production experience.').verdict, 'stretch');
 // An escape hatch removes the BAR, it does not make the job a comfortable fit:
 // a fresh graduate answering a 5-year ad on an equivalency clause is stretching,
 // and calling that "clear" would overstate it. So the hatch decides gated vs
