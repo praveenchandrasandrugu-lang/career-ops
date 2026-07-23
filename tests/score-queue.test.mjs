@@ -19,12 +19,23 @@
  * Run: node tests/score-queue.test.mjs  (or via test-all.mjs)
  */
 import { pass, fail } from './helpers.mjs';
-import { openQueue, upsertJobs } from '../queue.mjs';
+import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs';
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
+  setScore, scoredKeepers, slugify, runPool,
 } from '../score-queue.mjs';
 
 const T = (label, cond) => (cond ? pass(label) : fail(label));
+
+// A scoreable, claimed row: upsert, promote to llm_ready, add score columns,
+// claim it so it carries a fencing token — the state score-queue writes into.
+async function claimedDb(offers) {
+  const db = await openQueue(':memory:');
+  upsertJobs(db, offers, { now: 1_000 });
+  db.prepare("UPDATE jobs SET queue_status='llm_ready' WHERE 1").run();
+  addScoreColumns(db);
+  return db;
+}
 const eq = (label, got, want) => T(`${label}${got === want ? '' : ` (got ${JSON.stringify(got)})`}`, got === want);
 
 // ── band classification (keeper bar 3.5, top 4.0) ──────────────────────────
@@ -173,4 +184,95 @@ T('parseFinalJson: an object with no status is not accepted as the payload',
   let threw = false;
   try { addScoreColumns(db); } catch { threw = true; }
   T('addScoreColumns: is idempotent (safe to run on every open)', !threw);
+}
+
+// ── setScore: record the result ON the row, guarded by the claim token ──────
+// A worker may only write the score for the row IT holds. Guarding on the
+// fencing token (not just in_progress) stops a reclaimed-then-woken worker from
+// stamping a score onto a row that now belongs to someone else.
+
+{
+  const db = await claimedDb([{ url: 'https://co/jobs/1', company: 'Co', title: 'Analyst' }]);
+  const url = canonicalizeUrl('https://co/jobs/1');
+  const [claim] = claimUrls(db, [url], { now: 2_000, workerId: 'w1' });
+
+  const wrong = setScore(db, url, { score: 4.2, legitimacy: 'High Confidence', reportNum: '042', token: 'not-the-token', now: 3_000 });
+  T('setScore: a wrong token writes nothing (fencing)', wrong === false);
+  T('setScore: the score is still unset after a rejected write',
+    db.prepare('SELECT score FROM jobs WHERE canonical_url = ?').get(url).score === null);
+
+  const ok = setScore(db, url, { score: 4.2, legitimacy: 'High Confidence', reportNum: '042', token: claim.claim_token, now: 3_000 });
+  T('setScore: the holding token writes the score', ok === true);
+  const row = db.prepare('SELECT score, legitimacy, report_num, scored_at FROM jobs WHERE canonical_url = ?').get(url);
+  T('setScore: records the score', row.score === 4.2);
+  T('setScore: records the legitimacy tier', row.legitimacy === 'High Confidence');
+  T('setScore: records the report number', row.report_num === '042');
+  T('setScore: stamps scored_at', row.scored_at === 3_000);
+  T('setScore: leaves the row still claimed (completeClaim transitions it)',
+    db.prepare('SELECT queue_status FROM jobs WHERE canonical_url = ?').get(url).queue_status === 'in_progress');
+}
+
+// ── scoredKeepers: the rows the apply-queue is rendered from ────────────────
+// Reads back everything at or above the keeper bar, shaped for renderApplyQueue.
+
+{
+  const db = await claimedDb([
+    { url: 'https://co/jobs/1', company: 'Clay', title: 'Data Analyst' },
+    { url: 'https://co/jobs/2', company: 'Low', title: 'X' },
+    { url: 'https://co/jobs/3', company: 'Attio', title: 'FDE' },
+  ]);
+  const claim = (n) => claimUrls(db, [canonicalizeUrl(`https://co/jobs/${n}`)], { now: 2_000, workerId: 'w' })[0];
+  const c1 = claim(1), c2 = claim(2), c3 = claim(3);
+  setScore(db, c1.canonical_url, { score: 4.5, legitimacy: 'High Confidence', reportNum: '042', token: c1.claim_token, now: 3_000 });
+  setScore(db, c2.canonical_url, { score: 2.0, legitimacy: 'Suspicious', reportNum: '043', token: c2.claim_token, now: 3_000 });
+  setScore(db, c3.canonical_url, { score: 3.6, legitimacy: 'Proceed with Caution', reportNum: '044', token: c3.claim_token, now: 3_000 });
+
+  const keepers = scoredKeepers(db);
+  T('scoredKeepers: returns only rows at/above the keeper bar', keepers.length === 2);
+  T('scoredKeepers: excludes the sub-3.5 row', !keepers.some((r) => r.company === 'Low'));
+  T('scoredKeepers: carries the fields renderApplyQueue needs',
+    keepers.every((r) => 'score' in r && 'company' in r && 'role' in r && 'url' in r && 'report_num' in r));
+  // renderApplyQueue consumes it directly — the two must fit together.
+  const md = renderApplyQueue(scoredKeepers(db));
+  T('scoredKeepers: feeds renderApplyQueue (Clay above Attio)',
+    md.includes('Clay') && md.includes('Attio') && md.indexOf('Clay') < md.indexOf('Attio'));
+  T('scoredKeepers: a never-scored row (score NULL) is not a keeper', !md.includes('Low'));
+}
+
+// ── slugify: filesystem-safe company slug for the jd filename ───────────────
+
+eq('slugify: lowercases and hyphenates', slugify('Acme Corp'), 'acme-corp');
+eq('slugify: strips punctuation and collapses runs', slugify('Acme, Inc.  (US)'), 'acme-inc-us');
+eq('slugify: trims leading/trailing separators', slugify('  --Data & AI--  '), 'data-ai');
+eq('slugify: empty input yields empty string', slugify(''), '');
+eq('slugify: a slashy value cannot escape a directory', slugify('a/b/../c'), 'a-b-c');
+
+// ── runPool: bounded-concurrency fan-out, order preserved ───────────────────
+// The scorer runs Codex workers at a small concurrency cap. runPool must never
+// exceed the cap, must return results in INPUT order, and must run every item.
+
+{
+  let inFlight = 0, maxInFlight = 0;
+  const order = [];
+  const worker = async (item) => {
+    inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, item % 3 === 0 ? 5 : 15)); // uneven durations
+    order.push(item);
+    inFlight--;
+    return item * 10;
+  };
+  const items = Array.from({ length: 9 }, (_, i) => i + 1);
+  const results = await runPool(items, worker, { concurrency: 3 });
+  T('runPool: never exceeds the concurrency cap', maxInFlight <= 3);
+  T('runPool: actually uses the concurrency (more than one at once)', maxInFlight > 1);
+  T('runPool: runs every item', order.length === 9);
+  T('runPool: returns results in INPUT order despite uneven durations',
+    results.join(',') === items.map((i) => i * 10).join(','));
+}
+{
+  // concurrency larger than the item count is fine (runs them all at once).
+  const results = await runPool([1, 2], async (x) => x + 1, { concurrency: 10 });
+  T('runPool: handles concurrency > item count', results.join(',') === '2,3');
+  T('runPool: an empty item list returns an empty array',
+    (await runPool([], async (x) => x, { concurrency: 3 })).length === 0);
 }

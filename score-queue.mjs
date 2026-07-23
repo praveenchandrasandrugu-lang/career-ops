@@ -169,6 +169,90 @@ export function renderApplyQueue(rows = []) {
   return header + lines.join('\n') + '\n';
 }
 
+// ── recording the score, guarded by the claim token ────────────────────────
+
+/**
+ * Write a worker's result onto the row it holds. Guarded on the fencing token
+ * (not just `in_progress`), exactly like completeClaim: a worker that stalled
+ * long enough to be reclaimed must not be able to wake up and stamp its score
+ * onto a row that now belongs to a different worker. Leaves queue_status at
+ * `in_progress` — the caller transitions it with completeClaim once the score
+ * (and any tracker line) is durably recorded.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string} canonicalUrl
+ * @param {{score:number, legitimacy?:string, reportNum?:string, token?:string|null, now?:number}} opts
+ * @returns {boolean} true when this caller actually owned the row
+ */
+export function setScore(db, canonicalUrl, { score, legitimacy = null, reportNum = null, token = null, now = Date.now() } = {}) {
+  return db.prepare(`
+    UPDATE jobs SET score = ?, legitimacy = ?, report_num = ?, scored_at = ?
+    WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
+  `).run(score, legitimacy, reportNum, now, canonicalUrl, token).changes === 1;
+}
+
+/**
+ * Every scored row at or above the keeper bar, shaped for renderApplyQueue.
+ * `url` is the raw (clickable) URL, `role` the stored title. renderApplyQueue
+ * does the final sort/escaping, so this only has to select and rename.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {Array<{score:number, company:string, role:string, url:string, report_num:string}>}
+ */
+export function scoredKeepers(db) {
+  return db.prepare('SELECT score, company, title, raw_url, report_num FROM jobs WHERE score IS NOT NULL AND score >= ?')
+    .all(KEEPER_BAR)
+    .map((r) => ({ score: r.score, company: r.company, role: r.title, url: r.raw_url, report_num: r.report_num }));
+}
+
+// ── slugify: a filesystem-safe company slug for the jd filename ─────────────
+
+/**
+ * Lowercase, hyphenate, and strip a string down to [a-z0-9-] so it is safe as a
+ * filename component. Collapses runs of separators and trims them from the ends.
+ * Critically, a value like "a/b/../c" cannot walk out of its directory — every
+ * slash and dot becomes a separator.
+ *
+ * @param {unknown} text
+ * @returns {string}
+ */
+export function slugify(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+// ── runPool: bounded-concurrency fan-out ────────────────────────────────────
+
+/**
+ * Run `worker(item, index)` over every item with at most `concurrency` in
+ * flight, and return the results in INPUT order (not completion order). The
+ * scorer spawns Codex workers, which are expensive and rate-limited, so the cap
+ * is a hard ceiling; order preservation lets the caller line results up with
+ * their rows.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {(item:T, index:number)=>Promise<R>} worker
+ * @param {{concurrency?:number}} [opts]
+ * @returns {Promise<R[]>}
+ */
+export async function runPool(items, worker, { concurrency = 3 } = {}) {
+  const list = Array.isArray(items) ? items : [];
+  const results = new Array(list.length);
+  let next = 0;
+  const cap = Math.max(1, Math.floor(concurrency));
+  async function runner() {
+    while (next < list.length) {
+      const i = next++;
+      results[i] = await worker(list[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(cap, list.length) }, () => runner()));
+  return results;
+}
+
 // ── the column migration ────────────────────────────────────────────────────
 
 /**
