@@ -296,7 +296,7 @@ export async function runPool(items, worker, { concurrency = 3 } = {}) {
 export async function processRow(db, row, deps) {
   const {
     template, date, now = Date.now(), jdDir = 'jds', maxRetries = 3,
-    reserveNum, releaseNum, writeJd, runWorker,
+    reserveNum, releaseNum, writeJd, runWorker, discardTracker = () => {},
   } = deps;
   const token = row.claim_token;
   const url = row.canonical_url;
@@ -304,7 +304,13 @@ export async function processRow(db, row, deps) {
 
   const failed = (error) => {
     failClaim(db, url, { reason: String(error).slice(0, 200), maxRetries, token });
-    if (reportNum) { try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ } }
+    if (reportNum) {
+      // A worker can write its tracker TSV (batch-prompt.md step 5) and THEN
+      // fail/time out. merge-tracker runs unconditionally, so that orphan line
+      // would post a tracker row for a run the queue is retrying. Discard it.
+      try { discardTracker(reportNum); } catch { /* nothing was written */ }
+      try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
+    }
     return { url, status: 'failed', score: null, reportNum, error: String(error) };
   };
 
@@ -327,12 +333,36 @@ export async function processRow(db, row, deps) {
     if (!Number.isFinite(score)) return failed(`non-numeric score ${JSON.stringify(payload.score)}`);
 
     setScore(db, url, { score, legitimacy: payload.legitimacy ?? null, reportNum, token, now });
-    completeClaim(db, url, { status: 'evaluated', token });
+    // completeClaim is fenced on the claim token. If it returns false this
+    // worker's row was reclaimed mid-run and now belongs to someone else — the
+    // setScore above was refused too, so the DB is untouched. Do NOT report
+    // success or let this worker's tracker line be merged: it would double a row.
+    const owned = completeClaim(db, url, { status: 'evaluated', token });
     try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
+    if (!owned) {
+      try { discardTracker(reportNum); } catch { /* nothing was written */ }
+      return { url, status: 'lost', score, reportNum, error: 'claim lost (row reclaimed mid-run)' };
+    }
     return { url, status: 'evaluated', score, reportNum, error: null };
   } catch (err) {
     return failed(err?.message || err);
   }
+}
+
+/**
+ * Interpret a child process's (code, signal) as a single exit code, treating a
+ * signal-kill or a null code (OOM, SIGKILL, abnormal termination) as a FAILURE
+ * rather than a clean 0. `code ?? 0` would read a killed worker that happened to
+ * print a valid-looking payload as a success and record its score.
+ *
+ * @param {number|null} code
+ * @param {string|null} signal
+ * @returns {number} 0 only for a clean exit(0); non-zero otherwise
+ */
+export function exitCodeFrom(code, signal) {
+  if (signal) return 137;      // 128 + SIGKILL(9): killed, never a success
+  if (code == null) return 1;  // abnormal close with neither code nor signal
+  return code;
 }
 
 // ── the column migration ────────────────────────────────────────────────────
@@ -396,8 +426,12 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000 } = {}) {
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('error', (e) => { stderr += String(e?.message || e); finish(127); });
-    child.on('close', (code) => finish(code ?? 0));
-    child.stdin.end(prompt);
+    // (code, signal): a signal-kill must not be read as a clean exit (exitCodeFrom).
+    child.on('close', (code, signal) => finish(exitCodeFrom(code, signal)));
+    // If codex exits before draining stdin, end() emits EPIPE — swallow it; the
+    // close/error handler above is what turns the early exit into a failed run.
+    child.stdin.on('error', () => { /* worker already gone; handled via close */ });
+    try { child.stdin.end(prompt); } catch { /* EPIPE: worker already gone */ }
   });
 }
 
@@ -413,6 +447,13 @@ function liveDeps({ date, now }) {
       const abs = join(HERE, rel);
       mkdirSync(dirname(abs), { recursive: true });
       writeFileSync(abs, text ?? '');
+    },
+    // Remove a tracker TSV a failed/lost worker may have written, before
+    // merge-tracker sweeps the directory. The ID handed to the worker is the
+    // report number, so that is the TSV's basename.
+    discardTracker: (n) => {
+      const tsv = join(HERE, 'batch', 'tracker-additions', `${n}.tsv`);
+      try { if (existsSync(tsv)) unlinkSync(tsv); } catch { /* already gone */ }
     },
     runWorker: codexRunWorker,
   };
@@ -474,11 +515,21 @@ async function main() {
   writeApplyQueue(db); // establish the file even before the first result
 
   const deps = liveDeps({ date: today(), now: Date.now() });
-  let evaluated = 0, failed = 0, keepers = 0;
+  let evaluated = 0, failed = 0, lost = 0, keepers = 0;
   await runPool(claimed, async (row, i) => {
-    const res = await processRow(db, row, deps);
-    if (res.status === 'evaluated') { evaluated++; if (isKeeper(res.score)) keepers++; } else { failed++; }
-    writeApplyQueue(db); // refresh after every row so he can start applying immediately
+    // processRow catches its own errors, but a post-row throw (an fs write in
+    // writeApplyQueue) must never reject and abort the whole batch — that would
+    // strand every not-yet-started claimed row in_progress until stale reclaim.
+    let res;
+    try {
+      res = await processRow(db, row, deps);
+    } catch (e) {
+      res = { url: row.canonical_url, status: 'failed', score: null, reportNum: null, error: e?.message || String(e) };
+    }
+    if (res.status === 'evaluated') { evaluated++; if (isKeeper(res.score)) keepers++; }
+    else if (res.status === 'lost') lost++;
+    else failed++;
+    try { writeApplyQueue(db); } catch (e) { console.error(`apply-queue write failed (continuing): ${e?.message || e}`); }
     console.error(`  (${i + 1}/${claimed.length}) ${row.company}: ${res.status}${res.score != null ? ` ${res.score}` : ''}${res.error ? ` — ${res.error}` : ''}`);
     return res;
   }, { concurrency });
@@ -491,9 +542,9 @@ async function main() {
   }
   writeApplyQueue(db);
 
-  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed`);
+  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed${lost ? `, ${lost} lost (reclaimed mid-run)` : ''}`);
   console.error('apply queue: data/apply-queue.md');
-  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed }, null, 2));
+  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed, lost }, null, 2));
 }
 
 // Run the shell only on direct invocation; importing this module must be inert.

@@ -22,8 +22,9 @@ import { pass, fail } from './helpers.mjs';
 import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs';
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
-  setScore, scoredKeepers, slugify, runPool, processRow,
+  setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom,
 } from '../score-queue.mjs';
+import { reclaimStale } from '../queue.mjs';
 
 const T = (label, cond) => (cond ? pass(label) : fail(label));
 
@@ -289,7 +290,7 @@ async function rowFixture(stdout, { code = 0, reserveNum = () => '042' } = {}) {
   const url = canonicalizeUrl('https://co/jobs/9');
   db.prepare('UPDATE jobs SET jd_text = ?, jd_status = ? WHERE canonical_url = ?').run('We need an analyst.', 'ok', url);
   const [row] = claimUrls(db, [url], { now: 2_000, workerId: 'w1' });
-  const calls = { jd: [], prompts: [], released: [] };
+  const calls = { jd: [], prompts: [], released: [], discarded: [] };
   const deps = {
     template: 'JD={{JD_FILE}} URL={{URL}} N={{REPORT_NUM}} DATE={{DATE}} ID={{ID}}',
     date: '2026-07-23',
@@ -298,6 +299,7 @@ async function rowFixture(stdout, { code = 0, reserveNum = () => '042' } = {}) {
     reserveNum,
     releaseNum: (n) => calls.released.push(n),
     writeJd: (p, t) => calls.jd.push({ path: p, text: t }),
+    discardTracker: (n) => calls.discarded.push(n),
     runWorker: async (prompt) => { calls.prompts.push(prompt); return { stdout, code }; },
   };
   return { db, url, row, calls, deps };
@@ -327,6 +329,7 @@ const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num,
   T('processRow: prompt carries the real URL and jd path',
     calls.prompts[0].includes('https://co/jobs/9') && calls.prompts[0].includes('jds/042-clay-inc.txt'));
   T('processRow: released the report-number sentinel after the run', calls.released.includes('042'));
+  T('processRow: KEEPS the tracker line for a successful run (it gets merged)', calls.discarded.length === 0);
 }
 
 // failure path: the worker emitted a failed payload
@@ -341,7 +344,33 @@ const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num,
   eq('processRow: increments retry_count on failure', st.retry_count, 1);
   eq('processRow: never records a score for a failed run', st.score, null);
   T('processRow: still releases the reserved number on failure', calls.released.includes('042'));
+  T('processRow: discards the tracker line a failed worker may have written (never merged)',
+    calls.discarded.includes('042'));
 }
+
+// a worker that finishes AFTER its row was reclaimed must not report success or
+// contribute a tracker line — the DB fences (setScore/completeClaim) already
+// refuse the write; processRow must honor those booleans, not lie about it.
+{
+  const { db, url, row, calls, deps } = await rowFixture(COMPLETED);
+  // Reclaim the row out from under this worker (staleAfterMs 0 → instantly stale),
+  // which mints a new token; the row object we hold now carries a dead token.
+  reclaimStale(db, { staleAfterMs: 0, now: 3_000 });
+  const res = await processRow(db, row, deps);
+  eq('processRow: a lost claim is not reported as evaluated', res.status, 'lost');
+  eq('processRow: a lost claim writes no score', stateOf(db, url).score, null);
+  T('processRow: a lost claim discards its tracker line', calls.discarded.includes('042'));
+}
+
+// ── exitCodeFrom: a signal-killed worker is a failure, not a success ─────────
+// child.on('close', (code, signal)) gives code===null when the process was
+// killed. `code ?? 0` would read that OOM/SIGKILL as a clean exit and trust a
+// half-written payload. A signal (or a null code) must be non-zero.
+
+eq('exitCodeFrom: a clean exit 0 stays 0', exitCodeFrom(0, null), 0);
+eq('exitCodeFrom: a real non-zero code passes through', exitCodeFrom(1, null), 1);
+T('exitCodeFrom: a SIGKILL (code null, signal set) is non-zero', exitCodeFrom(null, 'SIGKILL') !== 0);
+T('exitCodeFrom: a null code with no signal is still treated as failure', exitCodeFrom(null, null) !== 0);
 
 // garbage stdout with no parseable payload is a failure, not a crash
 {
