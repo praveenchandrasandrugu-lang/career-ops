@@ -349,6 +349,7 @@ const USER_PATHS = [
   'reports/',
   'output/',
   'jds/',
+  'analysis/',
   'writing-samples/',
   'config/plugins.yml',
   'plugins.local/',
