@@ -8,6 +8,7 @@ data/queue.db-shm
 data/follow-ups.md
 data/salary-observations.tsv
 data/pipeline.md
+data/apply-queue.md
 data/scan-history.tsv
 data/scan-runs.tsv
 data/pdf-index.tsv

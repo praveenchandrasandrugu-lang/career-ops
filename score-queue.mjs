@@ -15,15 +15,29 @@
  * band is derived from the score at read time (bandFor), the same reason
  * freshness is never stored: a stored derivation rots when its rule changes.
  *
- * Built incrementally and test-first, exactly like queue.mjs. This increment
- * lands the pure, deterministic core (band classification, placeholder fill,
- * final-JSON extraction, apply-queue rendering) and the additive column
- * migration. The live Codex spawn (parallel workers, atomic claim via
- * queue.mjs, tracker merge) is the next increment, behind an --apply flag, so
- * this stage stays dry-run-safe by default like every other stage here.
+ * Built incrementally and test-first, exactly like queue.mjs. The pure core
+ * (band classification, placeholder fill, final-JSON extraction, apply-queue
+ * rendering, column migration) and the per-row orchestration (processRow) are
+ * unit-tested with no subprocess. The live Codex spawn, the driver loop, and
+ * the tracker merge are the thin I/O shell at the bottom of this file, behind
+ * an --apply flag — dry run by default, like every other stage here.
+ *
+ * Usage:
+ *   node score-queue.mjs                       # dry run: show the scoreable pool
+ *   node score-queue.mjs --apply               # score up to --limit rows (default 25)
+ *   node score-queue.mjs --apply --limit 3     # score just 3 (smoke test)
+ *   node score-queue.mjs --apply --concurrency 3
  */
 
-import { completeClaim, failClaim } from './queue.mjs';
+import { spawn, execFileSync } from 'node:child_process';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import {
+  completeClaim, failClaim, openQueue, listReady, claimUrls, reclaimStale,
+} from './queue.mjs';
 
 // ── the bands ───────────────────────────────────────────────────────────────
 // 3.5 is the candidate's REVEALED bar: of the 32 he actually applied to, 13
@@ -342,4 +356,147 @@ export function addScoreColumns(db) {
   for (const [name, decl] of Object.entries(columns)) {
     if (!have.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${decl}`);
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The live I/O shell — everything below runs only when this file is invoked
+// directly (node score-queue.mjs). Tests import the functions above and never
+// reach here. The shell is deliberately thin: the tested functions do the work.
+// ════════════════════════════════════════════════════════════════════════════
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The real Codex worker. Feeds the filled batch-prompt.md to `codex exec` on
+ * stdin and captures the agent's final message via `-o` (a clean single-message
+ * file, so parseFinalJson never has to fish the payload out of Codex's own event
+ * logging). Falls back to raw stdout if that file is empty. Bypasses approvals
+ * and the sandbox because the worker must write reports/PDFs and run
+ * generate-pdf.mjs unattended — the same trust model as the `claude -p` batch
+ * workers, and the prompt is trusted system-layer content.
+ */
+function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000 } = {}) {
+  return new Promise((resolve) => {
+    const outFile = join(tmpdir(), `codex-final-${randomUUID()}.txt`);
+    const args = [
+      'exec', '--dangerously-bypass-approvals-and-sandbox',
+      '-C', cwd, '-o', outFile, '-',
+    ];
+    const child = spawn('codex', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', done = false;
+    const finish = (code) => {
+      if (done) return; done = true;
+      clearTimeout(timer);
+      let finalMsg = '';
+      try { if (existsSync(outFile)) finalMsg = readFileSync(outFile, 'utf-8'); } catch { /* fall back to stdout */ }
+      try { if (existsSync(outFile)) unlinkSync(outFile); } catch { /* best effort */ }
+      resolve({ stdout: finalMsg.trim() ? finalMsg : stdout, stderr, code });
+    };
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } finish(124); }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => { stderr += String(e?.message || e); finish(127); });
+    child.on('close', (code) => finish(code ?? 0));
+    child.stdin.end(prompt);
+  });
+}
+
+/** Production dependency bag for processRow: real reserve/release/fs/spawn. */
+function liveDeps({ date, now }) {
+  const reserveScript = join(HERE, 'reserve-report-num.mjs');
+  return {
+    template: readFileSync(join(HERE, 'batch', 'batch-prompt.md'), 'utf-8'),
+    date, now, jdDir: 'jds',
+    reserveNum: () => execFileSync(process.execPath, [reserveScript], { cwd: HERE }).toString().trim(),
+    releaseNum: (n) => { try { execFileSync(process.execPath, [reserveScript, '--release', n], { cwd: HERE }); } catch { /* GC backstop */ } },
+    writeJd: (rel, text) => {
+      const abs = join(HERE, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, text ?? '');
+    },
+    runWorker: codexRunWorker,
+  };
+}
+
+/** Today's date as YYYY-MM-DD (local), the format batch-prompt.md expects. */
+function today() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/** Continuously (re)write data/apply-queue.md from whatever is scored so far. */
+function writeApplyQueue(db) {
+  writeFileSync(join(HERE, 'data', 'apply-queue.md'), renderApplyQueue(scoredKeepers(db)));
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const APPLY = argv.includes('--apply');
+  const flag = (name, def) => {
+    const i = argv.indexOf(name);
+    return i >= 0 && argv[i + 1] ? argv[i + 1] : def;
+  };
+  const limit = Math.max(1, parseInt(flag('--limit', '25'), 10) || 25);
+  const concurrency = Math.max(1, parseInt(flag('--concurrency', '3'), 10) || 3);
+
+  const db = await openQueue();
+  addScoreColumns(db);
+
+  // Recover any rows a previous run died holding before we compute the pool.
+  const recovered = reclaimStale(db, {});
+  if (recovered.length) console.error(`reclaimed ${recovered.length} stale in-progress row(s) from a prior run`);
+
+  // The scoreable pool: drain order (freshest first), but only rows that carry
+  // an ad. jd_status !== 'ok' can never be scored, and its freshness could
+  // otherwise float it to the top and starve rows that CAN be scored.
+  const pool = listReady(db, {}).filter((r) => r.jd_status === 'ok');
+  const buckets = pool.reduce((m, r) => { const b = r.freshness?.bucket || '?'; m[b] = (m[b] || 0) + 1; return m; }, {});
+
+  console.error(`\nscoreable pool: ${pool.length} rows (llm_ready + jd ok)`);
+  console.error(`  by freshness: ${Object.entries(buckets).map(([k, v]) => `${k} ${v}`).join(', ') || '(none)'}`);
+
+  if (!APPLY) {
+    console.error('\nDRY RUN — nothing scored. Pass --apply to score.');
+    console.error(`would score the first ${Math.min(limit, pool.length)} (of ${pool.length}); next up:`);
+    for (const r of pool.slice(0, Math.min(10, limit))) {
+      console.error(`  [${r.freshness?.bucket}] ${r.company} — ${r.title}`);
+    }
+    console.log(JSON.stringify({ applied: false, scoreable: pool.length, buckets, wouldScore: Math.min(limit, pool.length) }, null, 2));
+    return;
+  }
+
+  const batch = pool.slice(0, limit);
+  const urls = batch.map((r) => r.canonical_url);
+  const workerId = `score-${randomUUID().slice(0, 8)}`;
+  const claimed = claimUrls(db, urls, { workerId });
+  console.error(`\nclaimed ${claimed.length} row(s); scoring at concurrency ${concurrency} with Codex...`);
+  writeApplyQueue(db); // establish the file even before the first result
+
+  const deps = liveDeps({ date: today(), now: Date.now() });
+  let evaluated = 0, failed = 0, keepers = 0;
+  await runPool(claimed, async (row, i) => {
+    const res = await processRow(db, row, deps);
+    if (res.status === 'evaluated') { evaluated++; if (isKeeper(res.score)) keepers++; } else { failed++; }
+    writeApplyQueue(db); // refresh after every row so he can start applying immediately
+    console.error(`  (${i + 1}/${claimed.length}) ${row.company}: ${res.status}${res.score != null ? ` ${res.score}` : ''}${res.error ? ` — ${res.error}` : ''}`);
+    return res;
+  }, { concurrency });
+
+  // The workers wrote tracker TSVs to batch/tracker-additions/; merge them once.
+  try {
+    execFileSync(process.execPath, [join(HERE, 'merge-tracker.mjs')], { cwd: HERE, stdio: 'inherit' });
+  } catch (e) {
+    console.error(`merge-tracker failed (tracker rows are still in batch/tracker-additions/): ${e?.message || e}`);
+  }
+  writeApplyQueue(db);
+
+  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed`);
+  console.error('apply queue: data/apply-queue.md');
+  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed }, null, 2));
+}
+
+// Run the shell only on direct invocation; importing this module must be inert.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error(e); process.exit(1); });
 }
