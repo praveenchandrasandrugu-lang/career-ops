@@ -23,6 +23,8 @@
  * this stage stays dry-run-safe by default like every other stage here.
  */
 
+import { completeClaim, failClaim } from './queue.mjs';
+
 // ── the bands ───────────────────────────────────────────────────────────────
 // 3.5 is the candidate's REVEALED bar: of the 32 he actually applied to, 13
 // scored 3.5-3.9. A hard 4.0 would have discarded 24 of his own choices, so
@@ -251,6 +253,72 @@ export async function runPool(items, worker, { concurrency = 3 } = {}) {
   }
   await Promise.all(Array.from({ length: Math.min(cap, list.length) }, () => runner()));
   return results;
+}
+
+// ── processRow: score one claimed row end to end ────────────────────────────
+
+/**
+ * Take one already-claimed row through the full scoring pass. Every side effect
+ * is an injected dependency so the decision tree is testable with no subprocess
+ * and no filesystem:
+ *
+ *   reserve a report number → write the ad to jds/ → fill batch-prompt.md →
+ *   run a Codex worker → parse its final JSON → land the outcome on the queue.
+ *
+ * Success (the worker exited 0 AND printed a `completed` payload with a finite
+ * score) records the score and transitions the row to `evaluated`. Anything
+ * else — a failed payload, unparseable stdout, a non-zero exit, or a worker
+ * that threw — is a FAILURE, and a failure returns the row to `llm_ready` via
+ * failClaim (retryable, never silently dropped: dropping a job over one bad run
+ * is the outcome this pipeline refuses). The reserved report number is released
+ * in every case: on success the worker has written the real report so the
+ * sentinel's job is done; on failure the number is freed for reuse.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {object} row  a claimed row (carries canonical_url, raw_url, company, jd_text, claim_token)
+ * @param {object} deps  { template, date, now, jdDir, reserveNum, releaseNum, writeJd, runWorker, maxRetries }
+ * @returns {Promise<{url:string, status:'evaluated'|'failed', score:number|null, reportNum:string|null, error:string|null}>}
+ */
+export async function processRow(db, row, deps) {
+  const {
+    template, date, now = Date.now(), jdDir = 'jds', maxRetries = 3,
+    reserveNum, releaseNum, writeJd, runWorker,
+  } = deps;
+  const token = row.claim_token;
+  const url = row.canonical_url;
+  let reportNum = null;
+
+  const failed = (error) => {
+    failClaim(db, url, { reason: String(error).slice(0, 200), maxRetries, token });
+    if (reportNum) { try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ } }
+    return { url, status: 'failed', score: null, reportNum, error: String(error) };
+  };
+
+  try {
+    reportNum = reserveNum();
+    const slug = slugify(row.company) || 'job';
+    const jdFile = `${jdDir}/${reportNum}-${slug}.txt`;
+    writeJd(jdFile, row.jd_text ?? '');
+
+    const prompt = fillPrompt(template, {
+      url: row.raw_url, jdFile, reportNum, date, id: reportNum,
+    });
+    const { stdout, code } = await runWorker(prompt, { cwd: process.cwd() });
+
+    if (code !== 0) return failed(`worker exited ${code}`);
+    const payload = parseFinalJson(stdout);
+    if (!payload) return failed('no final JSON payload in worker output');
+    if (payload.status !== 'completed') return failed(payload.error || `worker status ${payload.status}`);
+    const score = Number(payload.score);
+    if (!Number.isFinite(score)) return failed(`non-numeric score ${JSON.stringify(payload.score)}`);
+
+    setScore(db, url, { score, legitimacy: payload.legitimacy ?? null, reportNum, token, now });
+    completeClaim(db, url, { status: 'evaluated', token });
+    try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
+    return { url, status: 'evaluated', score, reportNum, error: null };
+  } catch (err) {
+    return failed(err?.message || err);
+  }
 }
 
 // ── the column migration ────────────────────────────────────────────────────

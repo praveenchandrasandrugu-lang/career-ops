@@ -22,7 +22,7 @@ import { pass, fail } from './helpers.mjs';
 import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs';
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
-  setScore, scoredKeepers, slugify, runPool,
+  setScore, scoredKeepers, slugify, runPool, processRow,
 } from '../score-queue.mjs';
 
 const T = (label, cond) => (cond ? pass(label) : fail(label));
@@ -275,4 +275,99 @@ eq('slugify: a slashy value cannot escape a directory', slugify('a/b/../c'), 'a-
   T('runPool: handles concurrency > item count', results.join(',') === '2,3');
   T('runPool: an empty item list returns an empty array',
     (await runPool([], async (x) => x, { concurrency: 3 })).length === 0);
+}
+
+// ── processRow: the per-row orchestration, every side effect injected ───────
+// processRow reserves a report number, writes the ad to jds/, fills the prompt,
+// runs a Codex worker, parses its final JSON, and lands the outcome on the
+// queue. Here the worker/reserve/fs are all fakes, so the whole decision tree
+// is exercised with no subprocess and no network.
+
+// Build the fake dependency bag plus a claimed row to hand to processRow.
+async function rowFixture(stdout, { code = 0, reserveNum = () => '042' } = {}) {
+  const db = await claimedDb([{ url: 'https://co/jobs/9', company: 'Clay, Inc.', title: 'Data Analyst' }]);
+  const url = canonicalizeUrl('https://co/jobs/9');
+  db.prepare('UPDATE jobs SET jd_text = ?, jd_status = ? WHERE canonical_url = ?').run('We need an analyst.', 'ok', url);
+  const [row] = claimUrls(db, [url], { now: 2_000, workerId: 'w1' });
+  const calls = { jd: [], prompts: [], released: [] };
+  const deps = {
+    template: 'JD={{JD_FILE}} URL={{URL}} N={{REPORT_NUM}} DATE={{DATE}} ID={{ID}}',
+    date: '2026-07-23',
+    now: 5_000,
+    jdDir: 'jds',
+    reserveNum,
+    releaseNum: (n) => calls.released.push(n),
+    writeJd: (p, t) => calls.jd.push({ path: p, text: t }),
+    runWorker: async (prompt) => { calls.prompts.push(prompt); return { stdout, code }; },
+  };
+  return { db, url, row, calls, deps };
+}
+
+const COMPLETED = JSON.stringify({
+  status: 'completed', id: '042', report_num: '042', company: 'Clay', role: 'Data Analyst',
+  score: 4.5, legitimacy: 'High Confidence', pdf: null, report: 'reports/042-clay-2026-07-23.md', error: null,
+});
+const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num, retry_count FROM jobs WHERE canonical_url = ?').get(url);
+
+// happy path: a completed payload with a good score
+{
+  const { db, url, row, calls, deps } = await rowFixture(`noise...\n${COMPLETED}\ntokens used 500`);
+  const res = await processRow(db, row, deps);
+  const st = stateOf(db, url);
+  eq('processRow: reports evaluated', res.status, 'evaluated');
+  eq('processRow: returns the score', res.score, 4.5);
+  eq('processRow: row is now evaluated', st.queue_status, 'evaluated');
+  eq('processRow: score is recorded on the row', st.score, 4.5);
+  eq('processRow: report number recorded on the row', st.report_num, '042');
+  // the ad was written to a slug+num path that cannot escape jds/
+  eq('processRow: wrote the ad to the derived jd path', calls.jd[0]?.path, 'jds/042-clay-inc.txt');
+  eq('processRow: wrote the actual ad text', calls.jd[0]?.text, 'We need an analyst.');
+  // the prompt handed to the worker had every placeholder filled
+  T('processRow: filled the prompt (no {{ }} left)', !/\{\{|\}\}/.test(calls.prompts[0] || 'x{{y}}'));
+  T('processRow: prompt carries the real URL and jd path',
+    calls.prompts[0].includes('https://co/jobs/9') && calls.prompts[0].includes('jds/042-clay-inc.txt'));
+  T('processRow: released the report-number sentinel after the run', calls.released.includes('042'));
+}
+
+// failure path: the worker emitted a failed payload
+{
+  const failed = JSON.stringify({ status: 'failed', id: '042', report_num: '042', score: null, error: 'JD file empty' });
+  const { db, url, row, calls, deps } = await rowFixture(failed);
+  const res = await processRow(db, row, deps);
+  const st = stateOf(db, url);
+  eq('processRow: reports failed on a failed payload', res.status, 'failed');
+  T('processRow: surfaces the error text', /JD file empty/.test(res.error || ''));
+  eq('processRow: a failed row goes BACK to llm_ready (retryable, not dropped)', st.queue_status, 'llm_ready');
+  eq('processRow: increments retry_count on failure', st.retry_count, 1);
+  eq('processRow: never records a score for a failed run', st.score, null);
+  T('processRow: still releases the reserved number on failure', calls.released.includes('042'));
+}
+
+// garbage stdout with no parseable payload is a failure, not a crash
+{
+  const { db, url, row, deps } = await rowFixture('the model rambled but never emitted JSON');
+  const res = await processRow(db, row, deps);
+  eq('processRow: no-payload stdout is a failure', res.status, 'failed');
+  eq('processRow: no-payload row returns to llm_ready', stateOf(db, url).queue_status, 'llm_ready');
+}
+
+// a non-zero exit code is a failure even if a payload was printed (crashed run)
+{
+  const { db, url, row, deps } = await rowFixture(COMPLETED, { code: 1 });
+  const res = await processRow(db, row, deps);
+  eq('processRow: a non-zero exit code is a failure even with a payload', res.status, 'failed');
+  eq('processRow: the crashed row is retryable', stateOf(db, url).queue_status, 'llm_ready');
+}
+
+// the worker itself throwing (spawn error / timeout) must be caught, not leaked
+{
+  const { db, url, row, calls, deps } = await rowFixture(COMPLETED);
+  deps.runWorker = async () => { throw new Error('spawn ENOENT'); };
+  let threw = false;
+  let res;
+  try { res = await processRow(db, row, deps); } catch { threw = true; }
+  T('processRow: a thrown worker is caught, not leaked', !threw);
+  eq('processRow: a thrown worker is a failure', res.status, 'failed');
+  eq('processRow: a thrown-worker row is retryable', stateOf(db, url).queue_status, 'llm_ready');
+  T('processRow: still frees the reserved number when the worker throws', calls.released.includes('042'));
 }
