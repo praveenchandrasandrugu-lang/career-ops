@@ -344,6 +344,53 @@ export function claimNext(db, { limit = 1, now = Date.now(), workerId = 'worker'
 }
 
 /**
+ * Atomically claim a SPECIFIC, caller-chosen set of rows, in the given order.
+ *
+ * claimNext orders by read-time freshness and hands out the top N — but the
+ * scorer's eligible pool is "llm_ready AND jd_status='ok'", and the freshest
+ * rows are not always the ones with an ad. Filtering claimNext's output and
+ * releasing the rest would re-surface the same ad-less rows on the next call (a
+ * re-claim loop). claimUrls instead lets the caller compute its own pool in JS
+ * and claim exactly those URLs — same ownership proof as claimNext (`changes
+ * === 1` on a conditional update out of `llm_ready`), so two workers handed the
+ * same list can never both take a row.
+ *
+ * A URL that is not currently `llm_ready` (already claimed, terminal, or
+ * unknown) is silently skipped: the result is simply shorter. Order follows the
+ * input, since the caller has already put it in drain order.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string[]} urls  canonical URLs, in the order to claim them
+ * @param {{now?:number, workerId?:string}} [opts]
+ * @returns {Array<object>} the claimed rows, each with a `.claim_token`
+ */
+export function claimUrls(db, urls, { now = Date.now(), workerId = 'worker' } = {}) {
+  const list = Array.isArray(urls) ? urls : [];
+  if (!list.length) return [];
+  const fetch = db.prepare('SELECT * FROM jobs WHERE canonical_url = ?');
+  const take = db.prepare(`
+    UPDATE jobs SET queue_status = 'in_progress', claimed_at = ?, claimed_by = ?, claim_token = ?
+    WHERE canonical_url = ? AND queue_status = 'llm_ready'
+  `);
+  const claimed = [];
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const url of list) {
+      const token = randomUUID();
+      if (take.run(now, String(workerId), token, url).changes === 1) {
+        const row = fetch.get(url);
+        claimed.push({ ...row, queue_status: 'in_progress', claimed_at: now, claimed_by: String(workerId), claim_token: token });
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* connection is already unusable */ }
+    throw e;
+  }
+  return claimed;
+}
+
+/**
  * Finish a claimed row. Guarded on `in_progress`, so a worker cannot close out
  * a row it does not hold (a late reply from a reclaimed worker is a no-op).
  * @returns {boolean} true when this caller actually owned the row

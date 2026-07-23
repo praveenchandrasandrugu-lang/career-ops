@@ -257,7 +257,7 @@ await dbTests();
 // `changes === 1` IS the proof of ownership — the same shape as the #749
 // report-number race, one layer down.
 async function claimTests() {
-  const { claimNext, completeClaim, releaseClaim, failClaim, reclaimStale } = await import('../queue.mjs');
+  const { claimNext, claimUrls, completeClaim, releaseClaim, failClaim, reclaimStale } = await import('../queue.mjs');
   const DAYMS = 86_400_000;
   const mk = (n, over = {}) => ({
     url: `https://boards.greenhouse.io/acme/jobs/${n}`, company: 'Acme', title: `Analyst ${n}`,
@@ -380,6 +380,53 @@ async function claimTests() {
       rmSync(dir, { recursive: true, force: true });
     }
   }
+
+  // ── claimUrls: claim a SPECIFIC, pre-chosen set of rows ────────────────────
+  // The scorer picks its own eligible pool (llm_ready AND jd_status='ok') in JS,
+  // because claimNext's freshest-first order would otherwise keep handing back
+  // the same ad-less rows in a re-claim loop. claimUrls lets it claim exactly
+  // the URLs it chose — same compare-and-swap ownership proof as claimNext.
+  {
+    const db = await ready([mk(1), mk(2), mk(3)]);
+    const u1 = canonicalizeUrl(mk(1).url);
+    const u3 = canonicalizeUrl(mk(3).url);
+    const got = claimUrls(db, [u1, u3], { now: NOW, workerId: 'w1' });
+    T('claimUrls: claims exactly the requested urls', got.length === 2);
+    T('claimUrls: claimed rows are in_progress',
+      got.every((r) => statusOf(db, r.raw_url) === 'in_progress'));
+    T('claimUrls: a url NOT requested stays llm_ready',
+      statusOf(db, mk(2).url) === 'llm_ready');
+    T('claimUrls: preserves the caller-supplied order',
+      got.map((r) => r.canonical_url).join(',') === `${u1},${u3}`);
+    T('claimUrls: each claimed row carries a fencing token',
+      got.every((r) => typeof r.claim_token === 'string' && r.claim_token.length > 0));
+    // the token actually owns the row: completeClaim with it succeeds
+    T('claimUrls: the issued token can complete the claim',
+      completeClaim(db, u1, { status: 'evaluated', token: got[0].claim_token }) === true);
+  }
+  {
+    // A url that is not currently llm_ready (already claimed, evaluated, or
+    // never existed) is silently skipped — claimUrls returns fewer, never throws.
+    const db = await ready([mk(1), mk(2)]);
+    claimNext(db, { limit: 1, now: NOW, workerId: 'other' }); // takes the freshest (mk1==mk2 age, takes one)
+    const claimedUrl = db.prepare("SELECT canonical_url FROM jobs WHERE queue_status='in_progress'").get().canonical_url;
+    const readyUrl = db.prepare("SELECT canonical_url FROM jobs WHERE queue_status='llm_ready'").get().canonical_url;
+    const got = claimUrls(db, [claimedUrl, readyUrl, 'https://example.com/never-seen'], { now: NOW, workerId: 'w1' });
+    T('claimUrls: skips an already-claimed url', !got.some((r) => r.canonical_url === claimedUrl));
+    T('claimUrls: skips an unknown url', !got.some((r) => r.canonical_url === 'https://example.com/never-seen'));
+    T('claimUrls: still claims the one that WAS available', got.length === 1 && got[0].canonical_url === readyUrl);
+  }
+  {
+    // THE invariant, targeted form: two workers handed the SAME url list never
+    // both get the same row.
+    const db = await ready(Array.from({ length: 6 }, (_, i) => mk(i)));
+    const urls = allUrls(db);
+    const a = claimUrls(db, urls, { now: NOW, workerId: 'wa' });
+    const b = claimUrls(db, urls, { now: NOW, workerId: 'wb' });
+    const overlap = a.filter((x) => b.some((y) => y.canonical_url === x.canonical_url));
+    T('claimUrls: two workers on the same list never overlap', overlap.length === 0);
+    T('claimUrls: together they cover every available row', a.length + b.length === 6);
+  }
 }
 
 await claimTests();
@@ -463,7 +510,7 @@ await concurrencyTest();
 // therefore carries a unique token, and every transition out of the claim must
 // present it. This is the standard fencing-token fix for a lease.
 async function fencingTests() {
-  const { claimNext, completeClaim, releaseClaim, failClaim, reclaimStale } = await import('../queue.mjs');
+  const { claimNext, claimUrls, completeClaim, releaseClaim, failClaim, reclaimStale } = await import('../queue.mjs');
   const mk = (n) => ({
     url: `https://boards.greenhouse.io/acme/jobs/${n}`, company: 'Acme', title: `Analyst ${n}`,
     source: 'greenhouse', postedAt: NOW, confidence: 'exact',
