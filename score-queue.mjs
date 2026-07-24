@@ -41,14 +41,14 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
   completeClaim, failClaim, openQueue, listReady, claimUrls, reclaimStale,
-  setJdText, markJdFailure,
+  setJdText, markJdFailure, canonicalizeUrl,
 } from './queue.mjs';
 import { fetchJd } from './jd-fetch.mjs';
 
@@ -578,6 +578,64 @@ export function orderForSpend(rows = []) {
   });
 }
 
+// ── self-healing from the reports on disk ──────────────────────────────────
+
+/**
+ * Read a finished evaluation back out of its report header.
+ *
+ * processRow's order is: the worker writes the report and its tracker TSV, THEN
+ * the orchestrator records the score and completes the claim. A hard kill in
+ * that window leaves a fully finished evaluation the queue knows nothing about.
+ * Observed for real on 2026-07-24: report 322 (a 3.7 keeper) had its file and
+ * its tracker row, but reclaimStale correctly returned the queue row to
+ * llm_ready — so it was both missing from the apply queue AND queued to be paid
+ * for a second time.
+ *
+ * The report file is the durable artefact, so it is what recovery reads. Every
+ * field must be present and well-formed; a reserved-but-unwritten sentinel or a
+ * half-written file yields null rather than a guess.
+ *
+ * @param {string} markdown  the report's contents
+ * @param {string} filename  its basename, which carries the report number
+ * @returns {{url:string, score:number, reportNum:string}|null}
+ */
+export function parseReportHeader(markdown, filename = '') {
+  const md = String(markdown ?? '');
+  const url = md.match(/^\*\*URL:\*\*\s*(\S+)/m)?.[1];
+  const rawScore = md.match(/^\*\*Score:\*\*\s*([0-9.]+)\s*\/\s*5/m)?.[1];
+  const reportNum = String(filename).match(/^(\d{3,})-/)?.[1];
+  if (!url || !rawScore || !reportNum) return null;
+  const score = Number(rawScore);
+  if (!Number.isFinite(score)) return null;
+  return { url, score, reportNum };
+}
+
+/**
+ * Restore evaluations that finished on disk but never reached the queue.
+ *
+ * Strictly a repair, never a rewrite: it only touches rows that are still
+ * awaiting an LLM and carry NO score. A row the live scorer already recorded is
+ * authoritative over anything parsed from a file, so it is left alone.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {Array<{url:string, score:number, reportNum:string}>} reports
+ * @param {{now?:number}} [opts]
+ * @returns {Array<{url:string, score:number, reportNum:string}>} what was healed
+ */
+export function healFromReports(db, reports = [], { now = Date.now() } = {}) {
+  const stmt = db.prepare(`
+    UPDATE jobs SET score = ?, report_num = ?, scored_at = ?, queue_status = 'evaluated'
+    WHERE (canonical_url = ? OR raw_url = ?) AND score IS NULL AND queue_status = 'llm_ready'
+  `);
+  const healed = [];
+  for (const r of Array.isArray(reports) ? reports : []) {
+    if (!r?.url || !Number.isFinite(r.score)) continue;
+    const canon = canonicalizeUrl(r.url);
+    if (stmt.run(r.score, r.reportNum ?? null, now, canon, r.url).changes === 1) healed.push(r);
+  }
+  return healed;
+}
+
 // ── the column migration ────────────────────────────────────────────────────
 
 /**
@@ -761,6 +819,30 @@ function liveDeps({ date, now, fullAccess = false, db = null, refresh = true }) 
   };
 }
 
+/**
+ * Every finished report on disk, as {url, score, reportNum}.
+ *
+ * Cheap enough to do on every run (a few hundred small files, header-only
+ * parse), and it is the only way to notice an evaluation that completed but
+ * never reached the queue. Unreadable or half-written files are skipped rather
+ * than allowed to abort a scoring run.
+ */
+function readReportHeaders() {
+  const dir = join(HERE, 'reports');
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.md') || name.includes('RESERVED')) continue;
+    try {
+      // The header is the first few lines; no need to read a 200-line report.
+      const head = readFileSync(join(dir, name), 'utf-8').slice(0, 2000);
+      const parsed = parseReportHeader(head, name);
+      if (parsed) out.push(parsed);
+    } catch { /* unreadable file: skip, never abort the run */ }
+  }
+  return out;
+}
+
 /** Today's date as YYYY-MM-DD (local), the format batch-prompt.md expects. */
 function today() {
   const d = new Date();
@@ -806,6 +888,15 @@ async function main() {
   // never mistaken for a dead one by a second invocation (staleWindowMs).
   const recovered = reclaimStale(db, { staleAfterMs: staleWindowMs({ limit, concurrency }) });
   if (recovered.length) console.error(`reclaimed ${recovered.length} stale in-progress row(s) from a prior run`);
+
+  // ...then heal anything that finished on disk but never reached the queue.
+  // This runs AFTER the reclaim on purpose: a killed run's rows come back as
+  // llm_ready first, and any of them whose report was already written is
+  // recovered here rather than paid for a second time.
+  const healed = healFromReports(db, readReportHeaders());
+  if (healed.length) {
+    console.error(`recovered ${healed.length} evaluation(s) that finished on disk but never reached the queue (reports ${healed.map((h) => h.reportNum).join(', ')})`);
+  }
 
   // The scoreable pool: drain order (freshest first), but only rows that carry
   // an ad. jd_status !== 'ok' can never be scored, and its freshness could

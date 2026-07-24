@@ -24,6 +24,7 @@ import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
   killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend, closedReportNums,
+  parseReportHeader, healFromReports,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
 
@@ -722,3 +723,73 @@ eq('closedReportNums: a missing tracker yields an empty set, never a crash',
   closedReportNums('').size, 0);
 eq('closedReportNums: header and separator rows are not mistaken for entries',
   closedReportNums('| # | Date | Company |\n|---|---|---|').size, 0);
+
+// ── self-healing: a report written but never recorded on the row ────────────
+//
+// processRow's order is: worker writes the report and its tracker TSV, THEN the
+// orchestrator records the score and completes the claim. A hard kill in that
+// window (observed for real on 2026-07-24, report 322) leaves a fully finished
+// evaluation the QUEUE knows nothing about: the report file exists, the tracker
+// merged the row, but reclaimStale returns the queue row to llm_ready.
+//
+// Two costs, and both are exactly what this pipeline exists to prevent: the row
+// is scored again on the next run (paying twice for one job), and a real keeper
+// is missing from apply-queue.md because no score was ever stored.
+//
+// The report itself is the durable record, so it is the source of truth for
+// recovery. Parsing its header back onto the row heals the gap.
+{
+  const md = [
+    '# Evaluation: GreatAmerica - Business Support Financial Analyst',
+    '',
+    '**Date:** 2026-07-24',
+    '**Score:** 3.7/5',
+    '**Legitimacy:** High Confidence',
+    '**URL:** https://greatamerica.wd12.myworkdayjobs.com/careers/job/Analyst_JR1161',
+    '**Batch ID:** 322',
+  ].join('\n');
+  const h = parseReportHeader(md, '322-greatamerica-2026-07-24.md');
+  eq('parseReportHeader: reads the score', h?.score, 3.7);
+  eq('parseReportHeader: reads the URL', h?.url, 'https://greatamerica.wd12.myworkdayjobs.com/careers/job/Analyst_JR1161');
+  eq('parseReportHeader: takes the report number from the filename', h?.reportNum, '322');
+}
+// A reserved-but-unwritten sentinel carries no URL and must never be mistaken
+// for a finished evaluation.
+eq('parseReportHeader: a RESERVED sentinel yields nothing',
+  parseReportHeader('# RESERVED\n', '305-RESERVED.md'), null);
+eq('parseReportHeader: a report with no URL header yields nothing',
+  parseReportHeader('**Score:** 4.0/5\n', '310-x.md'), null);
+eq('parseReportHeader: a report with no score yields nothing',
+  parseReportHeader('**URL:** https://x/y\n', '310-x.md'), null);
+eq('parseReportHeader: a non-numeric score is refused rather than coerced',
+  parseReportHeader('**Score:** n/a\n**URL:** https://x/y\n', '310-x.md'), null);
+
+// The heal itself: only ever promotes an llm_ready row that has no score.
+{
+  const db = await claimedDb([{ url: 'https://co/jobs/9', company: 'Clay', title: 'Analyst' }]);
+  const url = canonicalizeUrl('https://co/jobs/9');
+  const healed = healFromReports(db, [{ url: 'https://co/jobs/9', score: 3.9, reportNum: '322' }]);
+  const st = db.prepare('SELECT queue_status, score, report_num FROM jobs WHERE canonical_url = ?').get(url);
+  eq('healFromReports: recovers the orphaned evaluation', healed.length, 1);
+  eq('healFromReports: records the score from the report', st.score, 3.9);
+  eq('healFromReports: records the report number', st.report_num, '322');
+  eq('healFromReports: moves the row out of the drain queue', st.queue_status, 'evaluated');
+}
+{
+  // A row that ALREADY has a score must not be rewritten — the live scorer's
+  // value is authoritative over a file parse.
+  const db = await claimedDb([{ url: 'https://co/jobs/9', company: 'Clay', title: 'Analyst' }]);
+  const url = canonicalizeUrl('https://co/jobs/9');
+  db.prepare("UPDATE jobs SET score = 4.4, queue_status = 'evaluated' WHERE canonical_url = ?").run(url);
+  const healed = healFromReports(db, [{ url: 'https://co/jobs/9', score: 3.9, reportNum: '322' }]);
+  eq('healFromReports: never overwrites an already-scored row', healed.length, 0);
+  eq('healFromReports: the live score survives',
+    db.prepare('SELECT score FROM jobs WHERE canonical_url = ?').get(url).score, 4.4);
+}
+{
+  // A report for a URL not in the queue is simply ignored, never an error.
+  const db = await claimedDb([{ url: 'https://co/jobs/9', company: 'Clay', title: 'Analyst' }]);
+  eq('healFromReports: an unknown URL heals nothing and does not throw',
+    healFromReports(db, [{ url: 'https://other/job/1', score: 4.0, reportNum: '999' }]).length, 0);
+  eq('healFromReports: an empty report list is fine', healFromReports(db, []).length, 0);
+}
