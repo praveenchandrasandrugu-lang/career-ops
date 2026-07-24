@@ -400,6 +400,22 @@ export async function processRow(db, row, deps) {
     if (code !== 0) return failed(`worker exited ${code}`);
     const payload = parseFinalJson(stdout);
     if (!payload) return failed('no final JSON payload in worker output');
+    // A DECIDED skip is not a failure. The free screens are regex and cannot see
+    // everything; some hard rejects only surface once the worker has the ad
+    // open. When it stops early instead of writing a full evaluation, that has
+    // to be terminal: `failed` returns the row to llm_ready with a bumped retry
+    // count, so recording a skip that way would pay for the same rejection
+    // twice. Same shape as the `closed` branch above.
+    if (payload.status === 'skipped') {
+      const why = String(payload.skip_reason || payload.error || 'worker skipped: no reason given').slice(0, 200);
+      completeClaim(db, url, { status: 'skipped', reason: `worker: ${why}`, token });
+      // No report was written, so the number goes back and any partial tracker
+      // line is dropped. Both are best-effort: the sentinel GC and the merge
+      // step each tolerate a leftover.
+      try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
+      try { discardTracker(reportNum); } catch { /* nothing was written */ }
+      return { url, status: 'skipped', score: null, reportNum: null, error: null };
+    }
     if (payload.status !== 'completed') return failed(payload.error || `worker status ${payload.status}`);
     const score = Number(payload.score);
     if (!Number.isFinite(score)) return failed(`non-numeric score ${JSON.stringify(payload.score)}`);
@@ -995,7 +1011,7 @@ async function main() {
   writeApplyQueue(db); // establish the file even before the first result
 
   const deps = liveDeps({ date: today(), now: Date.now(), fullAccess, db, refresh: !noRefresh });
-  let evaluated = 0, failed = 0, lost = 0, keepers = 0, closed = 0;
+  let evaluated = 0, failed = 0, lost = 0, keepers = 0, closed = 0, skipped = 0;
   await runPool(claimed, async (row, i) => {
     // processRow catches its own errors, but a post-row throw (an fs write in
     // writeApplyQueue) must never reject and abort the whole batch — that would
@@ -1009,6 +1025,7 @@ async function main() {
     if (res.status === 'evaluated') { evaluated++; if (isKeeper(res.score)) keepers++; }
     else if (res.status === 'lost') lost++;
     else if (res.status === 'closed') closed++;
+    else if (res.status === 'skipped') skipped++;
     else failed++;
     try { writeApplyQueue(db); } catch (e) { console.error(`apply-queue write failed (continuing): ${e?.message || e}`); }
     console.error(`  (${i + 1}/${claimed.length}) ${row.company}: ${res.status}${res.score != null ? ` ${res.score}` : ''}${res.error ? ` — ${res.error}` : ''}`);
@@ -1023,9 +1040,9 @@ async function main() {
   }
   writeApplyQueue(db);
 
-  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed${closed ? `, ${closed} closed (posting gone, not scored)` : ''}${lost ? `, ${lost} lost (reclaimed mid-run)` : ''}`);
+  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed${skipped ? `, ${skipped} skipped early (hard reject the free screens missed)` : ''}${closed ? `, ${closed} closed (posting gone, not scored)` : ''}${lost ? `, ${lost} lost (reclaimed mid-run)` : ''}`);
   console.error('apply queue: data/apply-queue.md');
-  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed, closed, lost }, null, 2));
+  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed, skipped, closed, lost }, null, 2));
 }
 
 // Run the shell only on direct invocation; importing this module must be inert.

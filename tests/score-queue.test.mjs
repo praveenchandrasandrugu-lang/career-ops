@@ -313,6 +313,52 @@ const COMPLETED = JSON.stringify({
 });
 const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num, retry_count FROM jobs WHERE canonical_url = ?').get(url);
 
+// ── the worker's early exit (candidate's idea, 2026-07-24) ────────────────
+// The free screens cannot catch everything: some hard rejects are only visible
+// once a human-shaped reader has the ad open. When the worker sees one it must
+// be able to stop BEFORE writing a full evaluation, and that stop has to be
+// recorded as a decided skip, not a crash -- `failed` means retry, so a skip
+// landing in `failed` would be paid for a second time. 53% of this run's rows
+// scored under 3.0, so this is where the waste is.
+{
+  const SKIPPED = JSON.stringify({
+    status: 'skipped', id: '042', skip_reason: 'requires an active DoD clearance',
+    score: null, report: null, pdf: null, error: null,
+  });
+  const { db, url, row, calls, deps } = await rowFixture(`read the ad...\n${SKIPPED}`);
+  const res = await processRow(db, row, deps);
+  const st = stateOf(db, url);
+  eq('processRow: an early skip reports skipped, not failed', res.status, 'skipped');
+  eq('processRow: an early skip carries no score', res.score, null);
+  eq('processRow: the row is terminal, so it is never paid for twice', st.queue_status, 'skipped');
+  eq('processRow: the retry counter is NOT bumped by a decided skip', st.retry_count, 0);
+  T('processRow: the skip reason is kept for auditing',
+    /clearance/i.test(db.prepare('SELECT skip_reason FROM jobs WHERE canonical_url = ?').get(url)?.skip_reason || ''));
+  // A skip writes no report, so its reserved number must go back to the pool
+  // and any half-written tracker line must be discarded.
+  eq('processRow: the reserved report number is released', calls.released[0], '042');
+  eq('processRow: no tracker line survives an early skip', calls.discarded[0], '042');
+}
+{
+  // A skip with no stated reason is still a skip, not a crash. The worker
+  // deciding badly is a prompt problem; recording it as `failed` would put it
+  // back in the paid queue, which is the failure mode this whole path exists
+  // to avoid.
+  const BARE = JSON.stringify({ status: 'skipped', id: '042', score: null, error: null });
+  const { db, url, row, deps } = await rowFixture(`${BARE}`);
+  const res = await processRow(db, row, deps);
+  eq('processRow: a reasonless skip is still terminal', res.status, 'skipped');
+  eq('processRow: a reasonless skip does not re-enter the queue', stateOf(db, url).queue_status, 'skipped');
+}
+{
+  // A genuine worker failure must NOT be swallowed by the new branch.
+  const BROKEN = JSON.stringify({ status: 'error', id: '042', error: 'JD file empty' });
+  const { db, url, row, deps } = await rowFixture(`${BROKEN}`);
+  const res = await processRow(db, row, deps);
+  eq('processRow: a real error is still failed, not quietly skipped', res.status, 'failed');
+  T('processRow: a real error stays retryable', stateOf(db, url).queue_status !== 'skipped');
+}
+
 // happy path: a completed payload with a good score
 {
   const { db, url, row, calls, deps } = await rowFixture(`noise...\n${COMPLETED}\ntokens used 500`);
