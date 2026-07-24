@@ -27,6 +27,12 @@
  *   node score-queue.mjs --apply               # score up to --limit rows (default 25)
  *   node score-queue.mjs --apply --limit 3     # score just 3 (smoke test)
  *   node score-queue.mjs --apply --concurrency 3
+ *   node score-queue.mjs --apply --full-access # lift the codex sandbox (see below)
+ *
+ * The codex workers are SANDBOXED by default (workspace-write): a job ad is
+ * untrusted internet text, so a prompt-injected ad cannot reach outside the
+ * repo. --full-access lifts the sandbox for runs where inline PDF/web research
+ * is worth the trust — an explicit per-run opt-in, never the default.
  */
 
 import { spawn, execFileSync } from 'node:child_process';
@@ -400,18 +406,23 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  * The real Codex worker. Feeds the filled batch-prompt.md to `codex exec` on
  * stdin and captures the agent's final message via `-o` (a clean single-message
  * file, so parseFinalJson never has to fish the payload out of Codex's own event
- * logging). Falls back to raw stdout if that file is empty. Bypasses approvals
- * and the sandbox because the worker must write reports/PDFs and run
- * generate-pdf.mjs unattended — the same trust model as the `claude -p` batch
- * workers, and the prompt is trusted system-layer content.
+ * logging). Falls back to raw stdout if that file is empty.
+ *
+ * SANDBOXED BY DEFAULT (`-s workspace-write`): the job ad is untrusted text
+ * fetched from the internet, so a prompt-injected ad must not be able to reach
+ * outside the repo. workspace-write lets the worker write its report/tracker/jd
+ * files and run repo scripts, and codex exec is non-interactive so an escalation
+ * it cannot perform is auto-denied, never a hang. `fullAccess: true` (the
+ * --full-access flag) lifts the sandbox for runs where inline PDF generation or
+ * live web research is worth the added trust — an explicit, per-run opt-in.
  */
-function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000 } = {}) {
+function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000, fullAccess = false } = {}) {
   return new Promise((resolve) => {
     const outFile = join(tmpdir(), `codex-final-${randomUUID()}.txt`);
-    const args = [
-      'exec', '--dangerously-bypass-approvals-and-sandbox',
-      '-C', cwd, '-o', outFile, '-',
-    ];
+    const sandbox = fullAccess
+      ? ['--dangerously-bypass-approvals-and-sandbox']
+      : ['-s', 'workspace-write'];
+    const args = ['exec', ...sandbox, '-C', cwd, '-o', outFile, '-'];
     const child = spawn('codex', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', done = false;
     const finish = (code) => {
@@ -436,7 +447,7 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000 } = {}) {
 }
 
 /** Production dependency bag for processRow: real reserve/release/fs/spawn. */
-function liveDeps({ date, now }) {
+function liveDeps({ date, now, fullAccess = false }) {
   const reserveScript = join(HERE, 'reserve-report-num.mjs');
   return {
     template: readFileSync(join(HERE, 'batch', 'batch-prompt.md'), 'utf-8'),
@@ -455,7 +466,7 @@ function liveDeps({ date, now }) {
       const tsv = join(HERE, 'batch', 'tracker-additions', `${n}.tsv`);
       try { if (existsSync(tsv)) unlinkSync(tsv); } catch { /* already gone */ }
     },
-    runWorker: codexRunWorker,
+    runWorker: (prompt, o) => codexRunWorker(prompt, { ...o, fullAccess }),
   };
 }
 
@@ -480,6 +491,7 @@ async function main() {
   };
   const limit = Math.max(1, parseInt(flag('--limit', '25'), 10) || 25);
   const concurrency = Math.max(1, parseInt(flag('--concurrency', '3'), 10) || 3);
+  const fullAccess = argv.includes('--full-access');
 
   const db = await openQueue();
   addScoreColumns(db);
@@ -511,10 +523,12 @@ async function main() {
   const urls = batch.map((r) => r.canonical_url);
   const workerId = `score-${randomUUID().slice(0, 8)}`;
   const claimed = claimUrls(db, urls, { workerId });
-  console.error(`\nclaimed ${claimed.length} row(s); scoring at concurrency ${concurrency} with Codex...`);
+  const mode = fullAccess ? 'FULL ACCESS (sandbox lifted)' : 'sandboxed (workspace-write)';
+  if (fullAccess) console.error('\n⚠️  --full-access: the codex workers run untrusted job-ad text with NO sandbox. Only use this on a machine you accept that risk on.');
+  console.error(`\nclaimed ${claimed.length} row(s); scoring at concurrency ${concurrency} with Codex [${mode}]...`);
   writeApplyQueue(db); // establish the file even before the first result
 
-  const deps = liveDeps({ date: today(), now: Date.now() });
+  const deps = liveDeps({ date: today(), now: Date.now(), fullAccess });
   let evaluated = 0, failed = 0, lost = 0, keepers = 0;
   await runPool(claimed, async (row, i) => {
     // processRow catches its own errors, but a post-row throw (an fs write in
