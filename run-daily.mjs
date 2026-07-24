@@ -52,11 +52,25 @@ export const STAGES = [
     key: 'scan',
     label: 'scan job boards',
     script: 'scan-ats-full.mjs',
-    base: ['--since', '7'],
+    // BOUNDED AND SHUFFLED, both deliberately.
+    //
+    // Unbounded, this walks the entire public aggregator dataset — 8,333
+    // greenhouse companies alone, and Workday is larger. Measured 2026-07-24 at
+    // ~5.7 companies/sec, so a full sweep is hours, not minutes. Run without a
+    // limit it looks exactly like a hang: no output (the summary prints at the
+    // end), and long quiet stretches with no open sockets. It is not hanging,
+    // it is just far larger than a daily habit can absorb.
+    //
+    // --shuffle is what makes the cap honest. sampleCompanies takes the
+    // dataset's ALPHABETICAL prefix by default, so a capped daily scan would
+    // see "0x, 100x, abinbev, abnormalsecurity..." every single day and never
+    // reach the rest of the alphabet. Shuffled, each run samples a different
+    // slice and coverage accumulates across days instead of standing still.
+    base: ['--since', '7', '--limit', '600', '--shuffle'],
     writes: [],
     dry: ['--dry-run'],
     costly: false,
-    note: 'network only, no model',
+    note: 'network only, no model; 600 companies/ATS, shuffled',
   },
   {
     key: 'migrate',

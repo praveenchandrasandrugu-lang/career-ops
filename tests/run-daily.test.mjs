@@ -133,3 +133,24 @@ T('planRun: a valid plan carries no error', planRun(['--apply']).error === null)
   T('renderFunnel: an empty pipeline says so plainly rather than printing zeros only',
     /nothing|empty|no /i.test(out));
 }
+
+// ── the scan stage must be bounded AND shuffled ────────────────────────────
+//
+// Unbounded, scan-ats-full walks the whole aggregator dataset: 8,333 greenhouse
+// companies alone, Workday larger, measured at ~5.7 companies/sec. That is
+// hours, and because the summary only prints at the end it is indistinguishable
+// from a hang -- exactly what happened on 2026-07-24 (72 minutes, no output,
+// nothing written, and it was working the whole time).
+//
+// The cap alone is not enough: sampleCompanies takes the dataset's ALPHABETICAL
+// prefix by default, so a capped daily scan would re-scan "0x, 100x, abinbev..."
+// every day forever and never reach the rest. --shuffle makes coverage
+// accumulate across runs instead of standing still.
+{
+  const scan = planRun(['--apply']).stages.find((s) => s.key === 'scan');
+  T('scan stage: is bounded by a company limit', scan.args.includes('--limit'));
+  T('scan stage: the limit is a real number', /^\d+$/.test(scan.args[scan.args.indexOf('--limit') + 1]));
+  T('scan stage: is shuffled, so a capped run does not re-scan the same alphabetical prefix daily',
+    scan.args.includes('--shuffle'));
+  T('scan stage: still carries a freshness window', scan.args.includes('--since'));
+}

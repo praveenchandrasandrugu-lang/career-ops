@@ -77,10 +77,32 @@ CAREER_OPS_PORTALS=portals-harsh.yml node scan-workday-targeted.mjs --limit 200 
 node scan-direct-sites.mjs --file data/direct-sites.txt --since 30
 ```
 
-⚠️ `scan-ats-full.mjs` can stall silently partway through a large Workday
-directory (upstream issue #2136). Observed 2026-07-24: 72 minutes, zero output,
-no open sockets, nothing written. If a scan goes quiet, kill it and use
-`scan-workday-targeted.mjs` instead — the queue keeps everything already found.
+### ⚠️ Always give `scan-ats-full.mjs` a `--limit`
+
+Unbounded it walks the **entire** public aggregator dataset: 8,333 greenhouse
+companies alone, and Workday is larger. Measured 2026-07-24 at ~5.7
+companies/sec, that is hours, not minutes.
+
+And it prints its summary only at the END, so a full sweep looks exactly like a
+hang: no output, long quiet stretches, nothing written to `pipeline.md` yet. On
+2026-07-24 a no-limit run was killed at 72 minutes as "stalled" when it was
+working correctly the whole time. (Upstream #2136 describes a genuine freeze in
+large Workday directories, so a real stall is also possible — but check the
+limit first.)
+
+Pair the limit with **`--shuffle`**. Without it, `sampleCompanies` takes the
+dataset's alphabetical prefix, so a capped scan sees `0x, 100x, abinbev, ...`
+every single day and never reaches the rest of the alphabet. Shuffled, each run
+samples a different slice and coverage accumulates.
+
+`run-daily.mjs` already does this (`--limit 600 --shuffle`). Running the scanner
+by hand, do the same:
+
+```bash
+node scan-ats-full.mjs --since 7 --limit 600 --shuffle
+```
+
+A genuine full sweep is a weekend job, not a daily one.
 
 ## Why each piece exists
 
