@@ -87,6 +87,10 @@ reports/*-RESERVED.md
 
 # Backup files written by normalize-statuses.mjs / dedup-tracker.mjs
 *.bak
+# Timestamped/labelled snapshots: `*.bak` does NOT match these, because the
+# label comes AFTER .bak (data/queue.db.bak-preaudit). Without this a 21 MB
+# database snapshot is one `git add -A` away from the history.
+*.bak-*
 
 # OpenRouter runner — generated data (personal, never commit)
 data/model-blacklist.json
