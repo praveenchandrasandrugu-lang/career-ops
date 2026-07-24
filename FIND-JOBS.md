@@ -1,29 +1,86 @@
-# How to find jobs now (2026-07-20)
+# How to find jobs now (updated 2026-07-24)
 
 The one-line goal: **surface only postings worth your attention, at employers that
-can legally hire you on STEM OPT.** Everything below is zero-token (no LLM cost)
-unless noted.
+can legally hire you on STEM OPT.** Every stage is zero-token (no LLM cost)
+except the last one, which is the only place a model is ever paid.
 
-## The daily run
+## The daily run — one command
 
 ```bash
-# 1. Thin-market, high-yield: big employers on Workday, keyword-targeted.
-#    This is the highest-yield scan. It breaks Workday's 2000-posting ceiling.
-CAREER_OPS_PORTALS=portals-harsh.yml node scan-workday-targeted.mjs --limit 200 --since 14
-
-# 2. Everything else on the major ATS platforms (nationwide, incl. remote).
-node scan-ats-full.mjs --since 7
-
-# 3. Employers with no supported ATS, straight off their careers page.
-node scan-direct-sites.mjs --file data/direct-sites.txt --since 30
+node run-daily.mjs                      # dry run: show the plan and the queue
+node run-daily.mjs --apply              # the free stages, for real
+node run-daily.mjs --apply --score 30   # ... and score 30 rows (THIS COSTS MONEY)
 ```
 
-Then, before spending real attention on anything:
+That is the whole pipeline, in the only order its data dependencies allow:
+
+```
+scan  ->  migrate  ->  gate  ->  fetch  ->  screen  ->  score  ->  data/apply-queue.md
+```
+
+| Stage | What it does | Cost |
+|-------|--------------|------|
+| `scan` | walk the ATS boards for new postings | network |
+| `migrate` | import `data/pipeline.md` into `data/queue.db` | free |
+| `gate` | drop stale, non-US and senior postings; record E-Verify | free |
+| `fetch` | download each job ad into the row (`jd_text`) | network |
+| `screen` | experience bars, hard gates, post-fetch geography | free |
+| `score` | Codex workers write a full A-G report and a score | **money** |
+
+Scoring is opt-in on every run and always carries a row budget, so "run the
+daily thing" can never become an unbounded spend. Everything else is free.
+
+Useful flags: `--skip scan` (work the existing queue), `--from gate` (resume
+after a failure — the runner prints the exact command), `--only fetch` (one
+stage). A stage name that does not exist is an error, never a silent no-op.
+
+**Read `data/apply-queue.md` when it finishes.** That is the output: keepers
+(score >= 3.5) highest first, 4.0+ on top, with the report link for each. Rows
+you have already applied to drop off it automatically once the tracker says so.
+
+Before spending real attention on any single posting:
 
 ```bash
 node everify-check.mjs check "<Company>" --summary   # can they hire you at all?
 node screen-level.mjs <url>                          # do you clear the experience bar?
 ```
+
+### Running a stage on its own
+
+The runner just sequences these, so any of them can still be run directly:
+
+```bash
+node queue-migrate.mjs           # pipeline.md -> queue.db (safe to re-run)
+node gate.mjs                    # 'new' -> llm_ready | skipped
+node fetch-jds.mjs --limit 400   # download ads, freshest first
+node screen-queue.mjs --apply    # screen verdicts (dry run without --apply)
+node score-queue.mjs             # dry run: show the scoreable pool
+node score-queue.mjs --apply --limit 30 --concurrency 3
+```
+
+`score-queue` re-fetches each ad immediately before scoring it, so a posting
+that closed since the last fetch is skipped for free rather than costing a full
+evaluation. `--no-refresh` turns that off for an offline run or a deliberate
+rescore.
+
+## The old per-scanner commands
+
+The runner's `scan` stage covers the broad ATS sweep. These remain for a
+targeted run:
+
+```bash
+# Thin-market, high-yield: big employers on Workday, keyword-targeted.
+# Breaks Workday's 2000-posting ceiling. Prefer this when the full sweep stalls.
+CAREER_OPS_PORTALS=portals-harsh.yml node scan-workday-targeted.mjs --limit 200 --since 14
+
+# Employers with no supported ATS, straight off their careers page.
+node scan-direct-sites.mjs --file data/direct-sites.txt --since 30
+```
+
+⚠️ `scan-ats-full.mjs` can stall silently partway through a large Workday
+directory (upstream issue #2136). Observed 2026-07-24: 72 minutes, zero output,
+no open sockets, nothing written. If a scan goes quiet, kill it and use
+`scan-workday-targeted.mjs` instead — the queue keeps everything already found.
 
 ## Why each piece exists
 

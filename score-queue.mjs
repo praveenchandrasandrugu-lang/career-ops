@@ -220,6 +220,40 @@ export function setScore(db, canonicalUrl, { score, legitimacy = null, reportNum
   `).run(score, legitimacy, reportNum, now, canonicalUrl, token).changes === 1;
 }
 
+// ── report numbers the candidate has already dealt with ────────────────────
+
+// A decision has been made about these, so the apply queue is done with them.
+// `Evaluated` is deliberately absent: it means scored-but-not-yet-acted-on,
+// which is exactly what the apply queue exists to surface.
+const CLOSED_STATES = new Set(['applied', 'responded', 'interview', 'offer', 'rejected', 'discarded', 'skip']);
+
+/**
+ * The report numbers in data/applications.md that are already closed out.
+ *
+ * scoredKeepers selects on score alone, so without this a keeper stays at the
+ * top of apply-queue.md forever — including after it has been applied to. The
+ * queue is meant to be worked from the top down, so a row that never leaves the
+ * top is a standing invitation to apply to the same employer twice.
+ *
+ * Parsed leniently from the markdown table: this must never throw or block a
+ * scoring run, and a tracker it cannot read simply excludes nothing.
+ *
+ * @param {string} trackerMd  the raw contents of data/applications.md
+ * @returns {Set<string>} zero-padded report numbers
+ */
+export function closedReportNums(trackerMd) {
+  const out = new Set();
+  for (const line of String(trackerMd ?? '').split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) continue;
+    const cells = line.split('|').map((c) => c.trim());
+    // cells[0] is the empty span before the leading pipe.
+    const num = cells[1];
+    if (!/^\d+$/.test(num || '')) continue; // header, separator, or a malformed row
+    if (cells.some((c) => CLOSED_STATES.has(c.replace(/\*/g, '').toLowerCase()))) out.add(num);
+  }
+  return out;
+}
+
 /**
  * Every scored row at or above the keeper bar, shaped for renderApplyQueue.
  * `url` is the raw (clickable) URL, `role` the stored title. renderApplyQueue
@@ -734,9 +768,19 @@ function today() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
-/** Continuously (re)write data/apply-queue.md from whatever is scored so far. */
+/**
+ * Continuously (re)write data/apply-queue.md from whatever is scored so far,
+ * minus anything the tracker says has already been decided. Without that filter
+ * an applied keeper stays pinned at the top of a list meant to be worked
+ * top-down, which is how one employer ends up with two applications.
+ */
 function writeApplyQueue(db) {
-  writeFileSync(join(HERE, 'data', 'apply-queue.md'), renderApplyQueue(scoredKeepers(db)));
+  let closed = new Set();
+  try {
+    closed = closedReportNums(readFileSync(join(HERE, 'data', 'applications.md'), 'utf-8'));
+  } catch { /* no tracker yet: nothing has been applied to, so exclude nothing */ }
+  const open = scoredKeepers(db).filter((r) => !closed.has(String(r.report_num ?? '')));
+  writeFileSync(join(HERE, 'data', 'apply-queue.md'), renderApplyQueue(open));
 }
 
 async function main() {

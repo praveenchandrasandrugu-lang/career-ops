@@ -23,7 +23,7 @@ import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs'
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
-  killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend,
+  killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend, closedReportNums,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
 
@@ -683,3 +683,42 @@ eq('titlePriority: Operations Specialist with no engineering noun is still prima
 eq('orderForSpend: an empty pool is not an error', orderForSpend([]).length, 0);
 eq('orderForSpend: a row with no freshness object is not dropped',
   orderForSpend([{ title: 'X' }]).length, 1);
+
+// ── the apply queue must not re-present a job already applied to ────────────
+//
+// scoredKeepers selects on score alone, so once a keeper is scored it stays at
+// the top of data/apply-queue.md forever — including after the candidate has
+// actually applied to it. The queue is meant to be worked from the top down, so
+// a row that never leaves the top is a standing invitation to apply twice to
+// the same employer. The tracker already knows: merge-tracker writes a status
+// per report number, and set-status.mjs moves it to Applied.
+//
+// Only CLOSED outcomes are excluded. `Evaluated` means scored-but-not-yet-acted
+// on, which is precisely what the apply queue exists to show.
+{
+  const done = new Set(['307', '308']);
+  const rows = [
+    { score: 4.2, company: 'A', role: 'Analyst', url: 'u1', report_num: '307' },
+    { score: 3.9, company: 'B', role: 'Analyst', url: 'u2', report_num: '309' },
+    { score: 3.6, company: 'C', role: 'Analyst', url: 'u3', report_num: '308' },
+  ];
+  const open = rows.filter((r) => !done.has(r.report_num));
+  const md = renderApplyQueue(open);
+  T('apply queue: an already-applied keeper is gone from the list', !md.includes('| A |'));
+  T('apply queue: a keeper not yet acted on is still listed', md.includes('| B |'));
+  T('apply queue: a second applied keeper is gone too', !md.includes('| C |'));
+}
+eq('closedReportNums: Applied is a closed outcome',
+  closedReportNums('| 307 | 2026-07-24 | A | Analyst | 4.2/5 | Applied | ✅ | [307](../reports/x.md) | n |').has('307'), true);
+eq('closedReportNums: Interview is closed (already in process)',
+  closedReportNums('| 310 | d | A | R | 4.0/5 | Interview | ✅ | [310](x) | n |').has('310'), true);
+eq('closedReportNums: Rejected is closed',
+  closedReportNums('| 311 | d | A | R | 4.0/5 | Rejected | ✅ | [311](x) | n |').has('311'), true);
+eq('closedReportNums: SKIP is closed (a decision was made)',
+  closedReportNums('| 312 | d | A | R | 2.0/5 | SKIP | ❌ | [312](x) | n |').has('312'), true);
+eq('closedReportNums: Evaluated is NOT closed — that is what the queue is for',
+  closedReportNums('| 313 | d | A | R | 4.0/5 | Evaluated | ✅ | [313](x) | n |').has('313'), false);
+eq('closedReportNums: a missing tracker yields an empty set, never a crash',
+  closedReportNums('').size, 0);
+eq('closedReportNums: header and separator rows are not mistaken for entries',
+  closedReportNums('| # | Date | Company |\n|---|---|---|').size, 0);
