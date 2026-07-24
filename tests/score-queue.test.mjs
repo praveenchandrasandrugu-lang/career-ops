@@ -378,7 +378,9 @@ T('exitCodeFrom: a null code with no signal is still treated as failure', exitCo
 // the command interpreter on Windows, direct exec everywhere else. Node still
 // auto-quotes argv when shell:false, so a path with a space survives.
 {
-  const args = ['exec', '-s', 'workspace-write', '-C', 'C:/Users/John Doe/repo', '-o', '/tmp/x y.txt', '-'];
+  // A repo path and out-file path that both contain a space — the case Windows
+  // shell:true quoting would mangle but cmd.exe /c with Node's argv-quoting keeps.
+  const args = ['exec', '-s', 'workspace-write', '-C', 'repo dir/career ops', '-o', 'out dir/x y.txt', '-'];
   const posix = buildCodexSpawn(args, { isWin: false });
   eq('buildCodexSpawn: POSIX runs codex directly', posix.cmd, 'codex');
   T('buildCodexSpawn: POSIX passes args through untouched', posix.spawnArgs.join('') === args.join(''));
