@@ -82,14 +82,25 @@ const DURATION_PREFIX_RE = /\b(?:for|within the last|in the last|over the (?:las
 
 // Phrasings that survive on the CANDIDATE's status, not the employer's
 // willingness. STEM OPT is temporary authorization, so these are real bars.
-const CITIZENSHIP_RE = /\b(?:must be (?:a |an )?u\.?s\.?(?:\.)? citizens?|u\.?s\.?(?:\.)? citizenship (?:is )?required|(?:open to )?u\.?s\.?(?:\.)? citizens only|citizens? only|must (?:have|hold|possess) (?:permanent|unrestricted|lawful permanent) work authorization)\b/i;
-// An ACTIVE clearance demand is a bar; see PREFERENCE_RE for what is not.
-const CLEARANCE_REQ_RE = /\b(?:requires?|must (?:possess|have|hold)|active)\s+(?:an?\s+)?(?:active\s+)?(?:ts\/sci|top secret|secret|dod|security)\s*(?:clearance)\b|\bclearance is required\b/i;
+const CITIZENSHIP_RE = /\b(?:must be (?:a |an )?u\.?s\.?(?:\.)? citizens?|u\.?s\.?(?:\.)? citizenship (?:is )?(?:required|only)|(?:open to )?u\.?s\.?(?:\.)? citizens only|citizens? only|u\.?s\.?(?:\.)? citizenship as a condition|must (?:have|hold|possess) (?:permanent|unrestricted|lawful permanent) work authorization)\b/i;
+// A clearance demand is a bar whether the ad wants one ALREADY HELD or merely
+// OBTAINABLE. For a US citizen "obtainable after hire" is a runway; for this
+// candidate it is a wall, because the US Government requires US citizenship to
+// hold a clearance — so a clearance he must obtain is one he can never obtain.
+const CLEARANCE_REQ_RE = /\b(?:requires?|must (?:possess|have|hold|be able to obtain)|active|ability to obtain|able to obtain)\s+(?:an?\s+|the\s+)?(?:active\s+|us\s+|u\.s\.\s+)?(?:ts\/sci|top secret|secret|dod|security)\s*(?:clearance)\b|\bclearance is required\b/i;
 // modes/_custom.md: "a clearance line under 'What We Value' is a preference,
-// not a bar." And a clearance obtainable after hire is a runway, not a wall.
-// Erring wide here is the safe direction: over-recognising a preference costs
-// one extra look, while missing one deletes a job the candidate could have had.
+// not a bar." Erring wide here is the safe direction: over-recognising a
+// preference costs one extra look, while missing one deletes a job the
+// candidate could have had.
 const PREFERENCE_RE = /\b(?:preferred|preferably|preferable|ideally|a plus|nice to have|desirable|desired|a bonus|not required|able to obtain|ability to obtain|willing(?:ness)? to obtain|eligible to obtain)\b/i;
+// The clearance check uses a NARROWER softener: everything above EXCEPT the
+// obtain-clauses. Leaving them in was the actual defect — the Boeing F-22 ads
+// said "requires the ability to obtain a US Security Clearance for which the US
+// Government requires US Citizenship", and that sentence's own "ability to
+// obtain" rescued it from its own gate. Three of them reached the paid scorer
+// and came back 1.4, 1.6 and 1.8. A certification obtainable after hire is
+// genuinely obtainable, so PREFERENCE_RE is unchanged for every other gate.
+const CLEARANCE_PREFERENCE_RE = /\b(?:preferred|preferably|preferable|ideally|a plus|nice to have|desirable|desired|a bonus|not required)\b/i;
 
 const COHORT_RE = /\b(?:must be graduating|graduating (?:in|by)|class of\s*20\d{2}|expected graduation(?: date)?|must be currently enrolled|currently enrolled in)\b[^.;•\n]{0,80}/i;
 
@@ -132,8 +143,8 @@ function sentenceAround(text, index) {
 }
 
 /** True when the sentence carrying the match softens it into a preference. */
-function isPreference(text, index) {
-  return PREFERENCE_RE.test(sentenceAround(text, index));
+function isPreference(text, index, re = PREFERENCE_RE) {
+  return re.test(sentenceAround(text, index));
 }
 
 /**
@@ -171,9 +182,12 @@ export function findExperienceBar(jdText) {
  */
 export function findCitizenshipGate(jdText) {
   const text = String(jdText ?? '');
-  for (const re of [CITIZENSHIP_RE, CLEARANCE_REQ_RE]) {
+  // Each gate carries its own softener: the clearance one must not accept
+  // "ability to obtain" as proof the demand is optional (see
+  // CLEARANCE_PREFERENCE_RE), while citizenship keeps the wide default.
+  for (const [re, softener] of [[CITIZENSHIP_RE, PREFERENCE_RE], [CLEARANCE_REQ_RE, CLEARANCE_PREFERENCE_RE]]) {
     const m = re.exec(text);
-    if (m && !isPreference(text, m.index)) return { gated: true, evidence: sentenceAround(text, m.index) };
+    if (m && !isPreference(text, m.index, softener)) return { gated: true, evidence: sentenceAround(text, m.index) };
   }
   return { gated: false, evidence: null };
 }

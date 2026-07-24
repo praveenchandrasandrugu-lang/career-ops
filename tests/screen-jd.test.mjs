@@ -91,8 +91,27 @@ T('findCitizenshipGate: an active-clearance requirement is a bar',
 // delete a large number of perfectly open roles.
 T('findCitizenshipGate: a clearance listed as PREFERRED is not a bar',
   findCitizenshipGate('Security clearance preferred but not required.').gated === false);
-T('findCitizenshipGate: an ability to OBTAIN a clearance later is not a bar',
-  findCitizenshipGate('Must be able to obtain a security clearance after hire.').gated === false);
+// REVERSED 2026-07-24, on evidence. "Obtainable after hire" is a runway for a
+// US citizen and a wall for this candidate: the US Government requires US
+// citizenship to hold a clearance, so a clearance he must obtain is one he can
+// never obtain. Three Boeing F-22 roles reached the PAID scorer behind this
+// exemption and scored 1.4, 1.6 and 1.8 -- the ad said "requires the ability to
+// obtain a US Security Clearance for which the US Government requires US
+// Citizenship", and the sentence's own "ability to obtain" rescued it from the
+// gate. The softener still applies to everything else (a cert obtainable after
+// hire IS obtainable), so only clearances change.
+T('findCitizenshipGate: an ability to OBTAIN a clearance is a bar (he cannot obtain one)',
+  findCitizenshipGate('Must be able to obtain a security clearance after hire.').gated === true);
+T('findCitizenshipGate: the real Boeing F-22 phrasing is a bar',
+  findCitizenshipGate('This position requires the ability to obtain a US Security Clearance for which the US Government requires US Citizenship as a condition of employment.').gated === true);
+T('findCitizenshipGate: "US Citizenship only" is a bar',
+  findCitizenshipGate('US Citizenship only. Applicants must be able to work in a secure facility.').gated === true);
+// The softener must survive for everything that is genuinely obtainable, or
+// this fix trades one silent loss for another.
+T('findNamedCertGate: an obtainable certification is STILL not a bar after the clearance fix',
+  findNamedCertGate('Must obtain Epic certification within 12 months of hire.').gated === false);
+T('findExperienceBar: an obtainable-phrased years line is unaffected',
+  findExperienceBar('5 years of experience preferred.').minYears === null);
 T('findCitizenshipGate: merely naming clearance work is not a bar',
   findCitizenshipGate('Our customers include agencies where clearance work happens.').gated === false);
 
