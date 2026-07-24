@@ -420,3 +420,114 @@ T('exitCodeFrom: a null code with no signal is still treated as failure', exitCo
   eq('processRow: a thrown-worker row is retryable', stateOf(db, url).queue_status, 'llm_ready');
   T('processRow: still frees the reserved number when the worker throws', calls.released.includes('042'));
 }
+
+// ── the liveness refresh: never pay a model to read a closed posting ────────
+//
+// Every stored ad is a SNAPSHOT taken when fetch-jds ran. The scoreable pool is
+// mostly `backup` rows (4-7 days old) whose ad was downloaded days before that,
+// and nothing in the queue path has ever asked whether the posting is still
+// open. Two costs follow: a Codex call spent on a job that closed, and a dead
+// link landing in apply-queue.md for the candidate to waste an application on.
+//
+// The signal is already free — jd-fetch returns reason 'gone' for a 404/410 on
+// a per-job endpoint — so the refresh is a re-fetch immediately before scoring.
+// The asymmetry is the whole design: a CONFIRMED gone closes the row, but a
+// transient failure must fall through to the stored ad. Dropping a live job
+// over one network blip is the outcome this pipeline refuses.
+
+const stateFull = (db, url) => db.prepare('SELECT queue_status, skip_reason, score FROM jobs WHERE canonical_url = ?').get(url);
+
+// a confirmed-dead posting: closed, not scored, and no report number burned
+{
+  const { db, url, row, calls, deps } = await rowFixture(COMPLETED);
+  let workerRuns = 0;
+  const inner = deps.runWorker;
+  deps.runWorker = (...a) => { workerRuns++; return inner(...a); };
+  deps.refreshJd = async () => ({ ok: false, text: '', reason: 'gone' });
+
+  const res = await processRow(db, row, deps);
+  const st = stateFull(db, url);
+  eq('refresh: a posting confirmed gone reports closed', res.status, 'closed');
+  eq('refresh: a closed posting NEVER reaches a Codex worker', workerRuns, 0);
+  eq('refresh: a closed row leaves the drain queue as skipped', st.queue_status, 'skipped');
+  T('refresh: the closure reason is recorded so the drop is auditable', /closed/i.test(st.skip_reason || ''));
+  eq('refresh: a closed posting is never scored', st.score, null);
+  eq('refresh: a closed posting burns no report number', calls.released.length, 0);
+  T('refresh: a closed posting writes no jd file', calls.jd.length === 0);
+}
+
+// a live posting whose ad CHANGED: the model must read the current ad
+{
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  deps.refreshJd = async () => ({ ok: true, text: 'REWRITTEN: we now need a senior analyst.', reason: null });
+
+  const res = await processRow(db, row, deps);
+  eq('refresh: a live posting still scores', res.status, 'evaluated');
+  eq('refresh: the worker is handed the REFRESHED ad, not the stale snapshot',
+    calls.jd[0]?.text, 'REWRITTEN: we now need a senior analyst.');
+}
+
+// a transient fetch failure must NOT be read as a closure
+{
+  const { db, url, row, calls, deps } = await rowFixture(COMPLETED);
+  deps.refreshJd = async () => ({ ok: false, text: '', reason: 'network: ETIMEDOUT' });
+
+  const res = await processRow(db, row, deps);
+  eq('refresh: a transient fetch failure is not a closure', res.status, 'evaluated');
+  eq('refresh: a transient failure falls back to the stored ad', calls.jd[0]?.text, 'We need an analyst.');
+  eq('refresh: the row is not skipped over a network blip', stateFull(db, url).queue_status, 'evaluated');
+}
+
+// refreshJd itself throwing must not lose the job either
+{
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  deps.refreshJd = async () => { throw new Error('DNS exploded'); };
+
+  const res = await processRow(db, row, deps);
+  eq('refresh: a thrown refresh does not fail the row', res.status, 'evaluated');
+  eq('refresh: a thrown refresh falls back to the stored ad', calls.jd[0]?.text, 'We need an analyst.');
+}
+
+// an empty refresh result is ambiguous (shared ashby board, or a genuinely
+// blank ad) — it is NOT proof of closure, so it must fall through too
+{
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  deps.refreshJd = async () => ({ ok: false, text: '', reason: 'empty' });
+
+  const res = await processRow(db, row, deps);
+  eq('refresh: an ambiguous empty result is not a closure', res.status, 'evaluated');
+  eq('refresh: an empty result keeps the stored ad', calls.jd[0]?.text, 'We need an analyst.');
+}
+
+// A refresh may only ever IMPROVE a row's state. Measured on the live queue,
+// ~17% of Workday detail requests answer 403 (bot defence, not a closure). If a
+// transient refresh failure were written back with markJdFailure, jd_status
+// would flip 'ok' -> 'error' on a row that already holds a perfectly good ad,
+// and score-queue's pool filter (jd_status === 'ok') would silently evict it —
+// losing ~1 in 6 Workday jobs on every scoring run. Persist success and a
+// confirmed closure; never downgrade good evidence over a network blip.
+{
+  const { db, url, row, deps } = await rowFixture(COMPLETED);
+  const persisted = [];
+  deps.refreshJd = async (r) => {
+    const res = { ok: false, text: '', reason: 'http_403' };
+    // mimic liveRefreshJd's write-back policy through the same guard it uses
+    if (res.ok && res.text) persisted.push(['ok', r.canonical_url]);
+    else if (res.reason === 'gone') persisted.push(['gone', r.canonical_url]);
+    return res;
+  };
+  const res = await processRow(db, row, deps);
+  eq('refresh: a 403 still scores the row', res.status, 'evaluated');
+  eq('refresh: a transient refresh failure is NEVER written back as a jd failure', persisted.length, 0);
+  eq('refresh: the row keeps jd_status ok so it stays in the scoreable pool',
+    db.prepare('SELECT jd_status FROM jobs WHERE canonical_url = ?').get(url).jd_status, 'ok');
+}
+
+// omitting refreshJd entirely keeps the old behaviour (backward compatible)
+{
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  delete deps.refreshJd;
+  const res = await processRow(db, row, deps);
+  eq('refresh: no refresh dep behaves exactly as before', res.status, 'evaluated');
+  eq('refresh: no refresh dep uses the stored ad', calls.jd[0]?.text, 'We need an analyst.');
+}

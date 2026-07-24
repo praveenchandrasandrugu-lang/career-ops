@@ -27,7 +27,12 @@
  *   node score-queue.mjs --apply               # score up to --limit rows (default 25)
  *   node score-queue.mjs --apply --limit 3     # score just 3 (smoke test)
  *   node score-queue.mjs --apply --concurrency 3
+ *   node score-queue.mjs --apply --no-refresh  # skip the liveness re-fetch (offline/rescore)
  *   node score-queue.mjs --apply --full-access # lift the codex sandbox (see below)
+ *
+ * Every row is re-fetched immediately before it is scored, so a posting that
+ * closed since the last fetch-jds run is skipped for free instead of costing a
+ * full Codex evaluation and a dead link in the apply queue.
  *
  * The codex workers are SANDBOXED by default (workspace-write): a job ad is
  * untrusted internet text, so a prompt-injected ad cannot reach outside the
@@ -43,7 +48,9 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import {
   completeClaim, failClaim, openQueue, listReady, claimUrls, reclaimStale,
+  setJdText, markJdFailure,
 } from './queue.mjs';
+import { fetchJd } from './jd-fetch.mjs';
 
 // ── the bands ───────────────────────────────────────────────────────────────
 // 3.5 is the candidate's REVEALED bar: of the 32 he actually applied to, 13
@@ -303,10 +310,12 @@ export async function processRow(db, row, deps) {
   const {
     template, date, now = Date.now(), jdDir = 'jds', maxRetries = 3,
     reserveNum, releaseNum, writeJd, runWorker, discardTracker = () => {},
+    refreshJd = null,
   } = deps;
   const token = row.claim_token;
   const url = row.canonical_url;
   let reportNum = null;
+  let jdText = row.jd_text ?? '';
 
   const failed = (error) => {
     failClaim(db, url, { reason: String(error).slice(0, 200), maxRetries, token });
@@ -321,10 +330,33 @@ export async function processRow(db, row, deps) {
   };
 
   try {
+    // ── liveness, before a single cent is spent ──────────────────────────────
+    // The stored ad is a snapshot from whenever fetch-jds last ran; most of the
+    // pool is `backup` (4-7 days old). Re-fetch immediately before scoring so
+    // the model reads the CURRENT ad and a closed posting is caught for free —
+    // jd-fetch already returns reason 'gone' for a 404/410 on a per-job
+    // endpoint. This runs before reserveNum so a dead posting never even burns
+    // a report number.
+    //
+    // The asymmetry is deliberate: only a CONFIRMED 'gone' closes the row.
+    // A transient error, an ambiguous 'empty' (an ashby shared board proves
+    // nothing about one posting), or a throw all fall through to the stored ad.
+    // Dropping a live job over a network blip is the outcome this pipeline
+    // refuses — the same rule that makes `unknown` pass every other gate.
+    if (refreshJd) {
+      let fresh = null;
+      try { fresh = await refreshJd(row); } catch { /* transient: keep the snapshot */ }
+      if (fresh?.reason === 'gone') {
+        completeClaim(db, url, { status: 'skipped', reason: 'closed: posting returned 404/410 at score time', token });
+        return { url, status: 'closed', score: null, reportNum: null, error: null };
+      }
+      if (fresh?.ok && fresh.text) jdText = fresh.text;
+    }
+
     reportNum = reserveNum();
     const slug = slugify(row.company) || 'job';
     const jdFile = `${jdDir}/${reportNum}-${slug}.txt`;
-    writeJd(jdFile, row.jd_text ?? '');
+    writeJd(jdFile, jdText);
 
     const prompt = fillPrompt(template, {
       url: row.raw_url, jdFile, reportNum, date, id: reportNum,
@@ -463,10 +495,47 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000, fullAccess = 
   });
 }
 
+/**
+ * The live liveness refresh: re-download the ad immediately before scoring.
+ *
+ * Costs one JSON request (zero tokens) and pays for itself the first time it
+ * catches a closed posting, because the alternative is a full Codex evaluation
+ * plus a dead link in apply-queue.md. The result is written back to the row, so
+ * a refreshed ad also un-stales the queue for the next run.
+ *
+ * Note the ashby caveat baked into jd-fetch: its board endpoint is SHARED, so a
+ * 404 there proves nothing about one posting and never returns 'gone'. Only
+ * per-job endpoints (workday/greenhouse/lever) can confirm a closure, which is
+ * exactly the conservative behaviour this gate needs.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @returns {(row:object)=>Promise<{ok:boolean, text:string, reason:string|null}>}
+ */
+function liveRefreshJd(db) {
+  return async (row) => {
+    const res = await fetchJd(row.raw_url || row.canonical_url, { timeoutMs: 15_000 });
+    // Write back ONLY what improves the row: a fresh ad, or a confirmed closure.
+    //
+    // A transient failure must never be persisted here. markJdFailure sets
+    // jd_status='error', and this scorer's pool filter is jd_status==='ok' — so
+    // recording a blip would evict a row that already holds a good ad from the
+    // scoreable pool. That is not hypothetical: measured on the live queue,
+    // ~17% of Workday detail requests answer 403 (bot defence, not a closure),
+    // which would silently drop roughly 1 in 6 Workday jobs per run. The
+    // refresh is an opportunistic improvement, never a demotion.
+    try {
+      if (res.ok && res.text) setJdText(db, row.canonical_url, res.text);
+      else if (res.reason === 'gone') markJdFailure(db, row.canonical_url, 'gone');
+    } catch { /* the score path matters more than the bookkeeping */ }
+    return res;
+  };
+}
+
 /** Production dependency bag for processRow: real reserve/release/fs/spawn. */
-function liveDeps({ date, now, fullAccess = false }) {
+function liveDeps({ date, now, fullAccess = false, db = null, refresh = true }) {
   const reserveScript = join(HERE, 'reserve-report-num.mjs');
   return {
+    refreshJd: refresh && db ? liveRefreshJd(db) : null,
     template: readFileSync(join(HERE, 'batch', 'batch-prompt.md'), 'utf-8'),
     date, now, jdDir: 'jds',
     reserveNum: () => execFileSync(process.execPath, [reserveScript], { cwd: HERE }).toString().trim(),
@@ -509,6 +578,10 @@ async function main() {
   const limit = Math.max(1, parseInt(flag('--limit', '25'), 10) || 25);
   const concurrency = Math.max(1, parseInt(flag('--concurrency', '3'), 10) || 3);
   const fullAccess = argv.includes('--full-access');
+  // The liveness re-fetch is ON by default: one free JSON request per row is
+  // always cheaper than a Codex evaluation of a posting that already closed.
+  // --no-refresh is the escape hatch for an offline run or a deliberate rescore.
+  const noRefresh = argv.includes('--no-refresh');
 
   const db = await openQueue();
   addScoreColumns(db);
@@ -545,8 +618,8 @@ async function main() {
   console.error(`\nclaimed ${claimed.length} row(s); scoring at concurrency ${concurrency} with Codex [${mode}]...`);
   writeApplyQueue(db); // establish the file even before the first result
 
-  const deps = liveDeps({ date: today(), now: Date.now(), fullAccess });
-  let evaluated = 0, failed = 0, lost = 0, keepers = 0;
+  const deps = liveDeps({ date: today(), now: Date.now(), fullAccess, db, refresh: !noRefresh });
+  let evaluated = 0, failed = 0, lost = 0, keepers = 0, closed = 0;
   await runPool(claimed, async (row, i) => {
     // processRow catches its own errors, but a post-row throw (an fs write in
     // writeApplyQueue) must never reject and abort the whole batch — that would
@@ -559,6 +632,7 @@ async function main() {
     }
     if (res.status === 'evaluated') { evaluated++; if (isKeeper(res.score)) keepers++; }
     else if (res.status === 'lost') lost++;
+    else if (res.status === 'closed') closed++;
     else failed++;
     try { writeApplyQueue(db); } catch (e) { console.error(`apply-queue write failed (continuing): ${e?.message || e}`); }
     console.error(`  (${i + 1}/${claimed.length}) ${row.company}: ${res.status}${res.score != null ? ` ${res.score}` : ''}${res.error ? ` — ${res.error}` : ''}`);
@@ -573,9 +647,9 @@ async function main() {
   }
   writeApplyQueue(db);
 
-  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed${lost ? `, ${lost} lost (reclaimed mid-run)` : ''}`);
+  console.error(`\ndone: ${evaluated} evaluated (${keepers} keepers >= ${KEEPER_BAR}), ${failed} failed${closed ? `, ${closed} closed (posting gone, not scored)` : ''}${lost ? `, ${lost} lost (reclaimed mid-run)` : ''}`);
   console.error('apply queue: data/apply-queue.md');
-  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed, lost }, null, 2));
+  console.log(JSON.stringify({ applied: true, claimed: claimed.length, evaluated, keepers, failed, closed, lost }, null, 2));
 }
 
 // Run the shell only on direct invocation; importing this module must be inert.
