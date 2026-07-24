@@ -23,7 +23,7 @@ import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs'
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
-  killTree, staleWindowMs, dedupePool,
+  killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
 
@@ -622,3 +622,64 @@ const stateFull = (db, url) => db.prepare('SELECT queue_status, skip_reason, sco
   ]);
   eq('dedupePool: empty ads are never treated as duplicates of each other', unique.length, 3);
 }
+
+// ── spend order: the candidate's own archetype tiers, not just freshness ────
+//
+// The drain was ordered by freshness alone, so 13 of the first 25 rows were
+// Engineer-titled. config/profile.yml records those as `secondary`/`avoid`, and
+// modes/_custom.md:69 records WHY: in a 40-role batch test every "Software
+// Engineer" posting scored under 3.0/5 — Anthropic, LangChain, Palantir,
+// Databricks and Vercel all landed 1.0-2.9 regardless of company quality. So
+// over half of every batch was being spent on roles his own measured data says
+// will fail, while Analyst-titled rows waited behind them.
+//
+// This is a PREFERENCE, never a filter. _custom.md is explicit: "Don't
+// hard-block Engineer/Architect titles entirely ... just don't lead scans/
+// batches with them." Nothing is dropped; the order changes.
+eq('titlePriority: an Analyst title is primary', titlePriority('Financial Analyst'), 0);
+eq('titlePriority: Operations is primary', titlePriority('Investment Operations Analyst'), 0);
+eq('titlePriority: a Clerk role is primary', titlePriority('Inventory Clerk'), 0);
+eq('titlePriority: a plain Software Engineer is deprioritised', titlePriority('Software Engineer'), 2);
+eq('titlePriority: Forward Deployed Engineer is the avoid tier', titlePriority('Forward Deployed Engineer'), 3);
+eq('titlePriority: Solutions Architect is the avoid tier', titlePriority('Solutions Architect'), 3);
+eq('titlePriority: an unclassified title sits between, never last', titlePriority('People Automation Partner'), 1);
+// "Data Analyst" must not be dragged down by the word Data; the Analyst noun wins.
+eq('titlePriority: Data Analyst is primary, not an engineering title', titlePriority('Data Analyst'), 0);
+// ...and an Analyst-flavoured engineering title still reads as the analyst tier,
+// because the noun that ends the title is the one that names the job.
+eq('titlePriority: Business Systems Analyst is primary', titlePriority('Business Systems Analyst'), 0);
+eq('titlePriority: a missing title is neutral, never last', titlePriority(undefined), 1);
+// The weaker primary words are common MODIFIERS, not job nouns, so an explicit
+// engineering noun beats them. "Software Engineer Specialist" is an engineering
+// role and must not be ranked ahead of a real Analyst posting.
+eq('titlePriority: Software Engineer Specialist is an engineering title, not primary',
+  titlePriority('Software Engineer Specialist'), 2);
+eq('titlePriority: Operations Specialist with no engineering noun is still primary',
+  titlePriority('Operations Specialist'), 0);
+
+// Freshness still leads: being an early applicant is the whole point of the
+// freshness model, so the tiers only reorder rows WITHIN a bucket.
+{
+  const rows = [
+    { title: 'Software Engineer', freshness: { bucket: 'fresh' }, company: 'a' },
+    { title: 'Financial Analyst', freshness: { bucket: 'backup' }, company: 'b' },
+    { title: 'Data Analyst', freshness: { bucket: 'fresh' }, company: 'c' },
+    { title: 'Forward Deployed Engineer', freshness: { bucket: 'hot' }, company: 'd' },
+  ];
+  const order = orderForSpend(rows).map((r) => r.company).join(',');
+  eq('orderForSpend: a hot row still outranks every fresh row, whatever its title', order[0], 'd');
+  eq('orderForSpend: within fresh, the Analyst comes before the Engineer', order, 'd,c,a,b');
+}
+{
+  // A stable sort: two rows in the same bucket AND tier keep their input order,
+  // which for a drain-ordered pool means the freshest of the two stays first.
+  const rows = [
+    { title: 'Data Analyst', freshness: { bucket: 'fresh' }, company: 'first' },
+    { title: 'Business Analyst', freshness: { bucket: 'fresh' }, company: 'second' },
+  ];
+  eq('orderForSpend: equal rows keep their existing drain order',
+    orderForSpend(rows).map((r) => r.company).join(','), 'first,second');
+}
+eq('orderForSpend: an empty pool is not an error', orderForSpend([]).length, 0);
+eq('orderForSpend: a row with no freshness object is not dropped',
+  orderForSpend([{ title: 'X' }]).length, 1);

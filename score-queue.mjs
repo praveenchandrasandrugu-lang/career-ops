@@ -467,6 +467,83 @@ export function dedupePool(rows = []) {
   return { unique, duplicates };
 }
 
+// ── spend order: the candidate's archetype tiers, applied to the drain ─────
+
+// The tiers are config/profile.yml's target_roles.archetypes `fit` values, and
+// the reason they exist is measured, not stylistic: modes/_custom.md records a
+// 40-role batch test in which EVERY "Software Engineer" posting scored under
+// 3.0/5 — Anthropic, LangChain, Palantir, Databricks and Vercel all landed
+// 1.0-2.9 regardless of company quality. The one hit was an Analyst II at 4.1.
+//
+// `avoid` is the narrowest tier and names specific role shapes ("Forward
+// Deployed", "Solutions Architect") that batch-tested at 1.4-2.8, not a whole
+// job family.
+const AVOID_TITLE_RE = /(forward[\s-]?deployed|solutions?\s+(?:architect|engineer)|sales\s+engineer)/i;
+// "Analyst" is the STRONG primary signal and outranks everything: it is the
+// exact noun profile.yml's primary tier is built on, and a title like "Business
+// Systems Analyst" is an analyst job however technical its modifiers sound.
+const ANALYST_TITLE_RE = /\banalysts?\b/i;
+const ENGINEERING_TITLE_RE = /(engineer|architect|developer|programmer|scientist|\bsre\b|devops)/i;
+// The weaker primary words. These are checked AFTER the engineering nouns,
+// because they are common modifiers rather than job nouns — "Software Engineer
+// Specialist" is an engineering role that happens to end in "Specialist", and
+// treating it as primary would put it ahead of a real Analyst posting.
+const PRIMARY_TITLE_RE = /(operations|clerk|coordinator|administrat|specialist|bookkeep|scheduler|planner|reporting)/i;
+
+/**
+ * Where a title sits in the candidate's own spend priority. Lower runs first.
+ *
+ *   0  primary    — Analyst / Operations / Clerk, his stated top tier
+ *   1  neutral    — unclassified; never last, because an unknown title is not
+ *                   evidence of a bad fit (the same asymmetry as every gate here)
+ *   2  secondary  — engineering titles, which batch-tested under 3.0
+ *   3  avoid      — the specific shapes profile.yml marks `fit: avoid`
+ *
+ * A title is read by the noun that NAMES the job, so "Business Systems Analyst"
+ * and "Data Analyst" are primary even though they carry technical words: the
+ * analyst check runs before the engineering one.
+ *
+ * This orders spend; it never drops a row. modes/_custom.md is explicit that
+ * engineering titles must still be evaluated when nothing better is available.
+ *
+ * @param {unknown} title
+ * @returns {0|1|2|3}
+ */
+export function titlePriority(title) {
+  const t = String(title ?? '').trim();
+  if (!t) return 1;
+  if (AVOID_TITLE_RE.test(t)) return 3;
+  if (ANALYST_TITLE_RE.test(t)) return 0;
+  if (ENGINEERING_TITLE_RE.test(t)) return 2;
+  if (PRIMARY_TITLE_RE.test(t)) return 0;
+  return 1;
+}
+
+const BUCKET_RANK = { hot: 0, fresh: 1, backup: 2, unknown: 3, stale: 4 };
+
+/**
+ * Order a scoreable pool by what is worth spending a model on first.
+ *
+ * Freshness still LEADS — being an early applicant is the entire point of the
+ * freshness model, and a hot row outranks everything. The archetype tier only
+ * reorders rows inside a bucket, which is where the waste was: the pool arrived
+ * freshness-sorted alone, so 13 of the first 25 rows were Engineer-titled while
+ * Analyst rows in the same bucket waited behind them.
+ *
+ * Sorted with a stable comparator over the already-drain-ordered input, so two
+ * rows of equal bucket and tier keep the freshest first.
+ *
+ * @param {Array<object>} rows
+ * @returns {Array<object>}
+ */
+export function orderForSpend(rows = []) {
+  return (Array.isArray(rows) ? [...rows] : []).sort((a, b) => {
+    const bucket = (BUCKET_RANK[a?.freshness?.bucket] ?? 3) - (BUCKET_RANK[b?.freshness?.bucket] ?? 3);
+    if (bucket !== 0) return bucket;
+    return titlePriority(a?.title) - titlePriority(b?.title);
+  });
+}
+
 // ── the column migration ────────────────────────────────────────────────────
 
 /**
@@ -695,7 +772,11 @@ async function main() {
   // hosts genuinely differ. Both rows carry the same ad, so the ad is the key.
   // Left in, the scorer pays twice and can put two applications in front of one
   // employer.
-  const { unique: pool, duplicates } = dedupePool(raw);
+  const { unique: deduped, duplicates } = dedupePool(raw);
+  // Freshness still leads; the archetype tier decides who goes first WITHIN a
+  // freshness bucket, so a batch is not spent on titles his own batch test
+  // already measured at under 3.0 while primary-tier rows wait behind them.
+  const pool = orderForSpend(deduped);
   const buckets = pool.reduce((m, r) => { const b = r.freshness?.bucket || '?'; m[b] = (m[b] || 0) + 1; return m; }, {});
 
   console.error(`\nscoreable pool: ${pool.length} rows (llm_ready + jd ok)`);
