@@ -133,6 +133,31 @@ T('planRun: a valid plan carries no error', planRun(['--apply']).error === null)
   T('renderFunnel: an empty pipeline says so plainly rather than printing zeros only',
     /nothing|empty|no /i.test(out));
 }
+// `evaluated` is not the same as "we paid a model for this". queue-migrate
+// imports pipeline.md's `## Processed` section straight to `evaluated`, so on
+// the live queue 150 rows are evaluated while only 28 carry a score. Reporting
+// the whole bucket as "already scored" overstates the spend by 5x and hides how
+// much of the pool has actually been through the scorer.
+{
+  const out = renderFunnel(
+    { new: 0, llm_ready: 1811, evaluated: 150, skipped: 8264 },
+    { keepers: 8, scored: 28 },
+  );
+  T('renderFunnel: reports what the model actually scored, not the whole evaluated bucket',
+    /28/.test(out));
+  T('renderFunnel: does not claim the 122 imported rows were scored',
+    !/already scored\s+150/.test(out));
+  T('renderFunnel: still accounts for the imported rows rather than dropping them',
+    /122/.test(out));
+}
+// Nothing scored yet, but a pile of imported rows: the advice must still be
+// "spend a model", not "no keepers found" -- the latter reads as a verdict on
+// jobs no model ever looked at.
+{
+  const out = renderFunnel({ new: 0, llm_ready: 900, evaluated: 122, skipped: 10 }, { keepers: 0, scored: 0 });
+  T('renderFunnel: zero scored with imported rows still prompts a scoring run',
+    /--score/.test(out));
+}
 
 // ── the scan stage must be bounded AND shuffled ────────────────────────────
 //

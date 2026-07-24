@@ -230,7 +230,7 @@ export function planRun(argv = []) {
  * @param {Record<string, number>} counts  queue_status → row count
  * @param {{keepers?:number}} [extra]
  */
-export function renderFunnel(counts = {}, { keepers = 0 } = {}) {
+export function renderFunnel(counts = {}, { keepers = 0, scored = null } = {}) {
   const n = (k) => Number(counts[k] || 0);
   const total = KEYS.length && Object.values(counts).reduce((a, b) => a + Number(b || 0), 0);
 
@@ -243,10 +243,17 @@ export function renderFunnel(counts = {}, { keepers = 0 } = {}) {
     ].join('\n');
   }
 
+  // `evaluated` means "done, never re-queue" -- which is NOT the same as "a
+  // model scored it". queue-migrate imports pipeline.md's `## Processed`
+  // section straight to `evaluated` with no score, so the bucket mixes rows the
+  // scorer paid for with rows inherited from the pre-scorer era. Report them
+  // apart when the caller knows the split, or the funnel overstates the spend.
+  const imported = scored == null ? 0 : Math.max(0, n('evaluated') - scored);
   const rows = [
     ['waiting to be gated', n('new')],
     ['queued for scoring', n('llm_ready')],
-    ['already scored', n('evaluated')],
+    scored == null ? ['already scored', n('evaluated')] : ['scored by the model', scored],
+    ...(imported > 0 ? [['done before the scorer', imported]] : []),
     ['filtered out', n('skipped')],
   ];
   const width = Math.max(...rows.map((r) => r[0].length));
@@ -256,7 +263,7 @@ export function renderFunnel(counts = {}, { keepers = 0 } = {}) {
   lines.push('');
   if (keepers > 0) {
     lines.push(`${keepers} keeper${keepers === 1 ? '' : 's'} waiting in data/apply-queue.md — start at the top.`);
-  } else if (n('evaluated') > 0) {
+  } else if ((scored == null ? n('evaluated') : scored) > 0) {
     lines.push('No keepers yet (nothing scored at or above 3.5). data/apply-queue.md is empty.');
   } else {
     lines.push('Nothing scored yet. Run with --score 25 to spend a model on the queue.');
@@ -279,7 +286,9 @@ async function queueCounts() {
   const rows = db.prepare('SELECT queue_status, COUNT(*) n FROM jobs GROUP BY 1').all();
   const counts = Object.fromEntries(rows.map((r) => [r.queue_status, r.n]));
   const keepers = db.prepare('SELECT COUNT(*) n FROM jobs WHERE score IS NOT NULL AND score >= 3.5').get()?.n ?? 0;
-  return { counts, keepers };
+  // A score is the only proof a model ran on a row; queue_status alone is not.
+  const scored = db.prepare('SELECT COUNT(*) n FROM jobs WHERE score IS NOT NULL').get()?.n ?? 0;
+  return { counts, keepers, scored };
 }
 
 async function main() {
@@ -316,7 +325,7 @@ Stages, in order: ${KEYS.join(' -> ')}
   }
 
   const before = await queueCounts();
-  console.error(renderFunnel(before.counts, { keepers: before.keepers }));
+  console.error(renderFunnel(before.counts, { keepers: before.keepers, scored: before.scored }));
 
   if (!plan.apply && plan.stages.every((s) => !s.dry)) {
     console.error('(every selected stage is write-only, so a dry run has nothing to show)');
@@ -354,7 +363,7 @@ Stages, in order: ${KEYS.join(' -> ')}
   }
 
   const after = await queueCounts();
-  console.error(renderFunnel(after.counts, { keepers: after.keepers }));
+  console.error(renderFunnel(after.counts, { keepers: after.keepers, scored: after.scored }));
   console.log(JSON.stringify({
     ok: true, apply: plan.apply, scoreLimit: plan.scoreLimit, results,
     queue: after.counts, keepers: after.keepers,
