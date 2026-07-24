@@ -27,6 +27,7 @@
  */
 import { openQueue, listReady } from './queue.mjs';
 import { screenJd } from './screen-jd.mjs';
+import { classifyLocationDeep } from './gate.mjs';
 
 const APPLY = process.argv.includes('--apply');
 const db = await openQueue();
@@ -47,8 +48,17 @@ try {
     const bucket = row.freshness?.bucket;
     if (fresh[bucket]) fresh[bucket].before++;
 
-    // A row with no ad is 'unknown' and stays in the queue untouched.
-    const { verdict, reasons } = screenJd(row.jd_text);
+    // Geography, re-asked now that the ad exists. gate.mjs could only read the
+    // location FIELD, and Workday's most common value there is a bare count
+    // ("2 Locations") that names nothing — so 394 of 921 scoreable rows reached
+    // this point with their geography unexamined, and 81 of them are actually
+    // in Bangalore, Belo Horizonte, Berlin or London. On an F-1 STEM OPT search
+    // those are unworkable, and each one otherwise costs a paid Codex call.
+    // Same asymmetry as every other gate: a US signal anywhere keeps the row.
+    const { verdict: screenVerdict, reasons } = classifyLocationDeep(row) === 'non_us'
+      ? { verdict: 'gated', reasons: [{ gate: 'non-US location', evidence: row.location || row.canonical_url }] }
+      : screenJd(row.jd_text);
+    const verdict = screenVerdict;
     counts[verdict]++;
     if (fresh[bucket] && verdict !== 'gated') fresh[bucket].after++;
 

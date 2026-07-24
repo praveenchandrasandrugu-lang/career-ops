@@ -48,7 +48,7 @@ const ASHBY_RE = /^https:\/\/jobs\.ashbyhq\.com\/([^/]+)\/([^/?#]+)/;
  * @returns {{ats:string, api:string, shared:boolean}|null} null when the site
  *   has no known JSON endpoint — callers must skip it, never guess a URL.
  */
-export function detailApiFor(jobUrl) {
+export function detailApiFor(jobUrl, { boardToken = '' } = {}) {
   const url = String(jobUrl ?? '').trim();
   if (!url.startsWith('https://') && !url.startsWith('http://')) return null;
   const https = url.replace(/^http:/, 'https:');
@@ -56,13 +56,13 @@ export function detailApiFor(jobUrl) {
   const wd = https.match(WORKDAY_RE);
   if (wd) {
     const [, tenant, instance, site, path] = wd;
-    return { ats: 'workday', api: `https://${tenant}.${instance}.myworkdayjobs.com/wday/cxs/${tenant}/${site}${path}`, shared: false };
+    return { ats: 'workday', api: `https://${tenant}.${instance}.myworkdayjobs.com/wday/cxs/${tenant}/${site}${path}`, shared: false, derived: false };
   }
 
   const gh = https.match(GREENHOUSE_RE);
   if (gh) {
     const [, eu, board, id] = gh;
-    return { ats: 'greenhouse', api: `https://boards-api${eu || ''}.greenhouse.io/v1/boards/${board}/jobs/${id}`, shared: false };
+    return { ats: 'greenhouse', api: `https://boards-api${eu || ''}.greenhouse.io/v1/boards/${board}/jobs/${id}`, shared: false, derived: false };
   }
 
   const lv = https.match(LEVER_RE);
@@ -70,14 +70,34 @@ export function detailApiFor(jobUrl) {
     const [, org, id] = lv;
     // Lever's own "/apply" page is the same posting; the id is what identifies it.
     if (id === 'apply') return null;
-    return { ats: 'lever', api: `https://api.lever.co/v0/postings/${org}/${id}`, shared: false };
+    return { ats: 'lever', api: `https://api.lever.co/v0/postings/${org}/${id}`, shared: false, derived: false };
   }
 
   const ab = https.match(ASHBY_RE);
   if (ab) {
     const [, org] = ab;
     // Shared: this one response carries every posting at the org.
-    return { ats: 'ashby', api: `https://api.ashbyhq.com/posting-api/job-board/${org}`, shared: true };
+    return { ats: 'ashby', api: `https://api.ashbyhq.com/posting-api/job-board/${org}`, shared: true, derived: false };
+  }
+
+  // Greenhouse-backed boards hosted on the COMPANY's own domain. Stripe,
+  // Coinbase, Databricks, Airbnb, Asana, Roblox, MongoDB, Waymo and Block all
+  // serve their listings from their own careers site and pass the posting id as
+  // a `gh_jid` query param, so none of them match GREENHOUSE_RE and all 64 such
+  // rows were written off `unsupported` — a silent permanent loss of exactly
+  // the employers most worth applying to.
+  //
+  // The board token is NOT guessable from the host (stripe.com's token could be
+  // anything), so it is a required caller input. Without it this stays
+  // unsupported rather than fabricating an endpoint — the same rule as every
+  // other branch here: never guess a URL.
+  if (boardToken) {
+    const jid = new URL(https).searchParams.get('gh_jid');
+    // Numeric only. A greenhouse job id is always an integer, and refusing
+    // anything else keeps a crafted value out of the constructed path.
+    if (jid && /^\d+$/.test(jid)) {
+      return { ats: 'greenhouse', api: `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(boardToken)}/jobs/${jid}`, shared: false, derived: true };
+    }
   }
 
   return null;
@@ -156,21 +176,40 @@ export function extractJdText(ats, payload, { url = '' } = {}) {
     for (const list of Array.isArray(payload.lists) ? payload.lists : []) {
       parts.push(list?.text, list?.content);
     }
+    // Lever publishes the pay band in its OWN field, not inside the description
+    // or the lists. Dropping it made the scorer report "no advertised salary
+    // figure" for roles that publish a real band, which lands verbatim in the
+    // report's advertised_comp.
+    parts.push(payload.salaryDescriptionPlain || payload.salaryDescription);
     parts.push(payload.additionalPlain || payload.additional);
     return htmlToText(parts.filter(Boolean).join('\n'));
   }
 
   if (ats === 'ashby') {
-    const jobs = Array.isArray(payload.jobs) ? payload.jobs : [];
-    const id = ashbyIdOf(url);
-    // Match on the id, not on jobUrl equality: the payload's jobUrl can carry
-    // tracking params the queue's canonical URL has already stripped.
-    const job = jobs.find((j) => j?.id === id) || (id ? jobs.find((j) => String(j?.jobUrl || '').includes(id)) : null);
+    const job = ashbyJobIn(payload, url);
     if (!job) return '';
     return htmlToText(job.descriptionPlain || job.descriptionHtml);
   }
 
   return '';
+}
+
+/**
+ * Find one posting inside an ashby org board payload.
+ *
+ * Match on the id, not on jobUrl equality: the payload's jobUrl can carry
+ * tracking params the queue's canonical URL has already stripped.
+ *
+ * @returns {object|null} the board entry, or null when this posting is not on
+ *   the board (which for ashby is the ONLY available proof of a closure).
+ */
+export function ashbyJobIn(payload, url) {
+  const jobs = Array.isArray(payload?.jobs) ? payload.jobs : null;
+  if (!jobs) return null;
+  const id = ashbyIdOf(url);
+  return jobs.find((j) => j?.id === id)
+    || (id ? jobs.find((j) => String(j?.jobUrl || '').includes(id)) : null)
+    || null;
 }
 
 /**
@@ -189,10 +228,10 @@ export function extractJdText(ats, payload, { url = '' } = {}) {
  *   from 'http_5xx'/'network:' (transient, retryable) from 'empty' (endpoint
  *   answered but carried no ad).
  */
-export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeoutMs = 20_000 } = {}) {
-  const target = detailApiFor(jobUrl);
+export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeoutMs = 20_000, boardToken = '' } = {}) {
+  const target = detailApiFor(jobUrl, { boardToken });
   if (!target) return { ok: false, text: '', ats: null, reason: 'unsupported', fromCache: false };
-  const { ats, api, shared } = target;
+  const { ats, api, shared, derived } = target;
   const cacheKey = shared && cache ? api : null;
 
   const load = async () => {
@@ -210,6 +249,16 @@ export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeout
         // it is one failed board request, and a slug-mapping mistake or a single
         // bad response would otherwise park every row at that org as permanently
         // dead. Shared 404s stay retryable.
+        //
+        // A DERIVED endpoint (gh_jid, whose board token was inferred from the
+        // queue's company slug) is a third case. Probed live 2026-07-24, that
+        // inference is right about 5 times in 6 — astspacemobile 404s under its
+        // slug while stripe/abnormalsecurity/fieldwire/place/clerkie all answer.
+        // A 404 there is evidence the TOKEN was wrong, not that the posting
+        // closed, so it degrades to 'unsupported' (the same verdict the row had
+        // before the fallback existed) instead of permanently killing a live job
+        // over a naming mismatch.
+        if (derived && (res.status === 404 || res.status === 410)) return { error: 'unsupported' };
         const dead = !shared && (res.status === 404 || res.status === 410);
         return { error: dead ? 'gone' : `http_${res.status}` };
       }
@@ -239,6 +288,27 @@ export async function fetchJd(jobUrl, { fetchImpl = fetch, cache = null, timeout
     outcome = await load();
   }
   if (outcome.error) return { ok: false, text: '', ats, reason: outcome.error, fromCache };
+
+  // Ashby's only proof of a closure is board MEMBERSHIP. It has no per-job
+  // endpoint, so the 404/410 rule above can never fire for it, and a removed
+  // posting simply stops appearing on the org board. Collapsing that into
+  // 'empty' — the same code a listed-but-description-less job returns — made
+  // every ashby closure invisible to the score-time liveness refresh.
+  //
+  // Measured on the live queue 2026-07-24: 11 of 94 ashby rows in the scoreable
+  // pool (11.7%) were already unlisted, against ~2% dead among the per-job
+  // ATSs. Ashby was the highest-death-rate source AND the only one whose deaths
+  // could not be seen. liveness-api.mjs has always drawn this distinction
+  // (classifyAshbyBoard → 'expired' on ashby_api_unlisted); this brings the
+  // fetch path in line with it.
+  //
+  // Conservative in both directions: a board whose shape is unrecognised
+  // (no jobs array) yields null here and falls through to 'empty' rather than
+  // declaring every posting at that org dead, and a failed board REQUEST stays
+  // retryable via the shared-endpoint rule above.
+  if (ats === 'ashby' && Array.isArray(outcome.payload?.jobs) && !ashbyJobIn(outcome.payload, jobUrl)) {
+    return { ok: false, text: '', ats, reason: 'gone', fromCache };
+  }
 
   const text = extractJdText(ats, outcome.payload, { url: jobUrl });
   if (!text) return { ok: false, text: '', ats, reason: 'empty', fromCache };

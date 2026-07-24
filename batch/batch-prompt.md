@@ -38,6 +38,7 @@ Examples:
 |------|------|------|
 | CV | `cv.md` | Always |
 | Profile customizations | `modes/_profile.md` if it exists | Always; user-specific archetypes, role-shape rules, location policy, comp targets |
+| House rules | `modes/_custom.md` if it exists | Always; procedural rules, thresholds, hard gates, CV/output preferences |
 | Profile config | `config/profile.yml` if it exists | Always; identity, output language, comp range, target roles |
 | Portfolio digest | `article-digest.md` if it exists | Always; proof points and metrics |
 | llms.txt | `llms.txt` if it exists | Always |
@@ -210,7 +211,7 @@ Assess whether the posting appears real and worth pursuing.
 Batch mode limitation: Playwright is not available, so exact apply-button state and freshness cannot be directly verified. Mark those signals as `unverified (batch mode)`.
 
 #### Score Global
-Read `modes/_custom.md` → Scoring Rules, if it exists, and apply its override here. Default (if absent or silent): calculate global score based on dimension scores below.
+Read `modes/_custom.md` → House Rules, if it exists, and apply its overrides here (that is where the candidate's scoring/threshold/hard-gate rules actually live; there is no "Scoring Rules" section). Default (if absent or silent): calculate global score based on dimension scores below.
 
 Use available signals:
 
@@ -296,7 +297,7 @@ Report header:
 **Score:** {X.X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **URL:** {{URL}}
-**PDF:** {output/cv-candidate-{company-slug}-{{DATE}}.pdf if score >= resolved auto_pdf_score_threshold, otherwise a localized equivalent of `not generated — run /career-ops pdf {company-slug} to create on demand` in `language.output`}
+**PDF:** {output/cv-candidate-{{REPORT_NUM}}-{company-slug}-{{DATE}}.pdf if score >= resolved auto_pdf_score_threshold, otherwise a localized equivalent of `not generated — run /career-ops pdf {company-slug} to create on demand` in `language.output`}
 **Batch ID:** {{ID}}
 
 
@@ -365,18 +366,41 @@ If score is greater than or equal to the threshold:
 8. Reorder experience bullets by relevance.
 9. Build a 6-8 item competency grid.
 10. Inject keywords ethically into existing achievements; never invent skills or metrics.
-11. Write HTML to `output/cv-candidate-{company-slug}.html`.
-12. Run:
+11. Write HTML to `output/cv-candidate-{{REPORT_NUM}}-{company-slug}.html`.
+
+    The report number is in the filename because several workers run at once and
+    two of them can hit the SAME company (a company routinely posts several
+    roles). Keyed on the slug alone, the second worker overwrites the first
+    worker's tailored HTML mid-run, and the PDF a report links to is then built
+    from a CV tailored for a different job. The report number is unique per run,
+    so it is the only safe key.
+
+12. Verify the CV invents nothing, then render it:
+
+```bash
+node verify-cv-facts.mjs output/cv-candidate-{{REPORT_NUM}}-{company-slug}.html
+```
+
+    This is a HARD GATE, exactly as in the interactive `pdf` mode. If it exits
+    non-zero, do NOT render a PDF and do NOT continue: emit the failure JSON with
+    `"error"` set to the verifier's output. A tailored CV is the one artefact
+    that goes to an employer under the candidate's name, so an invented metric
+    here is the most damaging output this pipeline can produce. Reordering,
+    reframing and re-emphasising are always allowed; inventing is never.
 
 ```bash
 node generate-pdf.mjs \
-  output/cv-candidate-{company-slug}.html \
-  output/cv-candidate-{company-slug}-{{DATE}}.pdf \
+  output/cv-candidate-{{REPORT_NUM}}-{company-slug}.html \
+  output/cv-candidate-{{REPORT_NUM}}-{company-slug}-{{DATE}}.pdf \
   --format={letter|a4} \
   --report={{REPORT_NUM}}
 ```
 
 On success, use `pdf_emoji` = `✅` and set `"pdf"` to the output path in the final JSON.
+
+13. Read `modes/_custom.md` → Output Preferences and apply every CV rule stated
+    there before rendering. Those are the candidate's own standing instructions
+    and they override the design defaults below.
 
 ATS rules:
 

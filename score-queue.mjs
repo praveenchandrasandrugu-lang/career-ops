@@ -403,6 +403,70 @@ export function exitCodeFrom(code, signal) {
   return code;
 }
 
+// ── how long a claim stays valid ────────────────────────────────────────────
+
+/** The per-worker Codex timeout, and the unit the stale window is built from. */
+export const WORKER_TIMEOUT_MS = 900_000;
+
+/**
+ * How long a claimed row may sit in_progress before another run may reclaim it.
+ *
+ * reclaimStale's 1h default was sized for a CRASHED run, and it is wrong for a
+ * long healthy one. A --limit 100 batch at concurrency 3 is 34 sequential waves;
+ * if each hit the 900s worker timeout that is over 8 hours of legitimate work.
+ * With a flat 1h window, a second invocation started meanwhile would reclaim
+ * rows the first run is still actively scoring — two paid Codex workers on one
+ * job, and the one that finishes second has its claim refused and throws its
+ * (already paid for) work away.
+ *
+ * So the window is derived from the batch's own worst case rather than fixed,
+ * with 1h as a floor and 1.5x headroom for process startup and the refresh.
+ *
+ * @param {{limit?:number, concurrency?:number, timeoutMs?:number}} opts
+ * @returns {number} milliseconds
+ */
+export function staleWindowMs({ limit = 25, concurrency = 3, timeoutMs = WORKER_TIMEOUT_MS } = {}) {
+  const rows = Math.max(0, Math.floor(limit) || 0);
+  const workers = Math.max(1, Math.floor(concurrency) || 1);
+  const waves = Math.ceil(rows / workers) || 0;
+  return Math.max(3_600_000, Math.ceil(waves * timeoutMs * 1.5));
+}
+
+// ── pool deduplication: never send one employer two applications ────────────
+
+/**
+ * Collapse rows that are the SAME posting reached by different URLs.
+ *
+ * canonicalizeUrl cannot catch these: a company's own careers domain and its
+ * ATS host are genuinely different URLs, and both are real. What gives them
+ * away is that both rows carry the same downloaded ad — so the ad text is the
+ * content key. Without this the scorer pays twice for one job and, worse, can
+ * put two applications in front of one employer.
+ *
+ * Whitespace is normalised before hashing because one ATS pretty-prints its
+ * HTML and another does not; matching exact bytes would miss the real duplicate.
+ * An EMPTY ad is never a key — it is the absence of evidence, and collapsing on
+ * it would delete unrelated jobs.
+ *
+ * The first occurrence wins, and since the pool arrives in drain order
+ * (freshest first) that is the freshest copy of the posting.
+ *
+ * @param {Array<object>} rows
+ * @returns {{unique:Array<object>, duplicates:Array<{row:object, duplicateOf:string}>}}
+ */
+export function dedupePool(rows = []) {
+  const seen = new Map();
+  const unique = [];
+  const duplicates = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const key = String(row?.jd_text ?? '').replace(/\s+/g, ' ').trim();
+    if (!key) { unique.push(row); continue; }
+    if (seen.has(key)) duplicates.push({ row, duplicateOf: seen.get(key) });
+    else { seen.set(key, row.canonical_url); unique.push(row); }
+  }
+  return { unique, duplicates };
+}
+
 // ── the column migration ────────────────────────────────────────────────────
 
 /**
@@ -452,6 +516,36 @@ export function buildCodexSpawn(args, { isWin = process.platform === 'win32', co
 }
 
 /**
+ * Kill a worker AND everything it spawned.
+ *
+ * On Windows the child is `cmd.exe /c codex ...` (buildCodexSpawn — npm installs
+ * codex as a .cmd, which spawn with shell:false cannot launch directly). A plain
+ * child.kill() there terminates only the interpreter: codex itself is a
+ * grandchild, survives, and keeps running a paid model to completion. Worse, it
+ * finishes by writing the tracker TSV that the timeout path had already
+ * discarded, so a run the queue has marked failed still posts a tracker row.
+ *
+ * taskkill /T walks the process tree; /F is required because codex will not
+ * exit on a polite signal it never receives. POSIX keeps the direct SIGKILL —
+ * codex is the child there, with no interpreter in between.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{isWin?:boolean, spawnImpl?:Function}} [opts]
+ * @returns {boolean} true when a tree-kill was issued (Windows), false for the
+ *   direct-signal path — the return exists so this is testable without a process.
+ */
+export function killTree(child, { isWin = process.platform === 'win32', spawnImpl = spawn } = {}) {
+  if (isWin && child?.pid) {
+    try {
+      spawnImpl('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      return true;
+    } catch { /* fall through to the direct signal below */ }
+  }
+  try { child?.kill?.('SIGKILL'); } catch { /* already gone */ }
+  return false;
+}
+
+/**
  * The real Codex worker. Feeds the filled batch-prompt.md to `codex exec` on
  * stdin and captures the agent's final message via `-o` (a clean single-message
  * file, so parseFinalJson never has to fish the payload out of Codex's own event
@@ -482,7 +576,7 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000, fullAccess = 
       try { if (existsSync(outFile)) unlinkSync(outFile); } catch { /* best effort */ }
       resolve({ stdout: finalMsg.trim() ? finalMsg : stdout, stderr, code });
     };
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } finish(124); }, timeoutMs);
+    const timer = setTimeout(() => { killTree(child); finish(124); }, timeoutMs);
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('error', (e) => { stderr += String(e?.message || e); finish(127); });
@@ -513,7 +607,7 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000, fullAccess = 
  */
 function liveRefreshJd(db) {
   return async (row) => {
-    const res = await fetchJd(row.raw_url || row.canonical_url, { timeoutMs: 15_000 });
+    const res = await fetchJd(row.raw_url || row.canonical_url, { timeoutMs: 15_000, boardToken: String(row.company || '').trim() });
     // Write back ONLY what improves the row: a fresh ad, or a confirmed closure.
     //
     // A transient failure must never be persisted here. markJdFailure sets
@@ -587,16 +681,25 @@ async function main() {
   addScoreColumns(db);
 
   // Recover any rows a previous run died holding before we compute the pool.
-  const recovered = reclaimStale(db, {});
+  // The window is sized to THIS batch's worst case, so a long healthy run is
+  // never mistaken for a dead one by a second invocation (staleWindowMs).
+  const recovered = reclaimStale(db, { staleAfterMs: staleWindowMs({ limit, concurrency }) });
   if (recovered.length) console.error(`reclaimed ${recovered.length} stale in-progress row(s) from a prior run`);
 
   // The scoreable pool: drain order (freshest first), but only rows that carry
   // an ad. jd_status !== 'ok' can never be scored, and its freshness could
   // otherwise float it to the top and starve rows that CAN be scored.
-  const pool = listReady(db, {}).filter((r) => r.jd_status === 'ok');
+  const raw = listReady(db, {}).filter((r) => r.jd_status === 'ok');
+  // The same posting is routinely reachable at two URLs (a company's own careers
+  // domain and its ATS host), which canonicalizeUrl cannot collapse because the
+  // hosts genuinely differ. Both rows carry the same ad, so the ad is the key.
+  // Left in, the scorer pays twice and can put two applications in front of one
+  // employer.
+  const { unique: pool, duplicates } = dedupePool(raw);
   const buckets = pool.reduce((m, r) => { const b = r.freshness?.bucket || '?'; m[b] = (m[b] || 0) + 1; return m; }, {});
 
   console.error(`\nscoreable pool: ${pool.length} rows (llm_ready + jd ok)`);
+  if (duplicates.length) console.error(`  (${duplicates.length} duplicate posting(s) collapsed — same ad under a different URL)`);
   console.error(`  by freshness: ${Object.entries(buckets).map(([k, v]) => `${k} ${v}`).join(', ') || '(none)'}`);
 
   if (!APPLY) {

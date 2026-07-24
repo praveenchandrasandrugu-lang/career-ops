@@ -293,3 +293,122 @@ eq('detailApiFor: a script-subtag locale (zh-Hans) is dropped too',
 eq('detailApiFor: a non-locale first segment is treated as the site, not a locale',
   detailApiFor('https://acme.wd1.myworkdayjobs.com/careers/job/NY/Analyst_R1')?.api,
   'https://acme.wd1.myworkdayjobs.com/wday/cxs/acme/careers/job/NY/Analyst_R1');
+
+// ── ashby board-absence is a CLOSURE, not an empty ad ───────────────────────
+//
+// Ashby has no per-job endpoint, so the 404/410 rule that proves a workday or
+// greenhouse posting is dead can never fire for it. A removed ashby posting
+// simply stops appearing in the org board, which the extractor collapsed into
+// '' — indistinguishable from a job that IS listed but carries no description.
+// That single collapse hid every ashby closure from the score-time refresh.
+//
+// Measured on the live queue 2026-07-24: 11 of 94 ashby rows in the scoreable
+// pool (11.7%) were already unlisted, versus ~2% dead among the per-job ATSs.
+// Ashby is the highest-death-rate source in the pool and was the one source
+// whose deaths were invisible.
+//
+// The discriminator is board MEMBERSHIP, which liveness-api.mjs has always used
+// (classifyAshbyBoard → 'expired' on ashby_api_unlisted). A failed board
+// REQUEST still stays retryable — one bad response must never mark every job at
+// that org dead.
+{
+  const board = (jobs) => async () => ({ ok: true, status: 200, json: async () => ({ jobs }) });
+
+  const listed = await fetchJd('https://jobs.ashbyhq.com/acme/j1', {
+    fetchImpl: board([{ id: 'j1', jobUrl: 'https://jobs.ashbyhq.com/acme/j1', descriptionPlain: 'Real ad' }]),
+  });
+  eq('fetchJd: an ashby job still on the board is ok', listed.ok, true);
+
+  const removed = await fetchJd('https://jobs.ashbyhq.com/acme/j1', {
+    fetchImpl: board([{ id: 'other', jobUrl: 'https://jobs.ashbyhq.com/acme/other', descriptionPlain: 'A different job' }]),
+  });
+  eq('fetchJd: an ashby job MISSING from a healthy board is gone, not empty', removed.reason, 'gone');
+  eq('fetchJd: a removed ashby job is not ok', removed.ok, false);
+
+  // Listed but description-less is genuinely ambiguous and must stay 'empty':
+  // the posting exists, so closing it would be a false positive.
+  const blank = await fetchJd('https://jobs.ashbyhq.com/acme/j1', {
+    fetchImpl: board([{ id: 'j1', jobUrl: 'https://jobs.ashbyhq.com/acme/j1', descriptionPlain: '' }]),
+  });
+  eq('fetchJd: an ashby job that IS listed but has no text stays empty (never closed)', blank.reason, 'empty');
+
+  // A board whose shape changed (no jobs array) proves nothing about any one
+  // posting — degrade to empty rather than declaring the whole org dead.
+  const weird = await fetchJd('https://jobs.ashbyhq.com/acme/j1', {
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ unexpected: true }) }),
+  });
+  eq('fetchJd: an unrecognised ashby board shape is not a closure', weird.reason, 'empty');
+
+  // And a failed board REQUEST is still retryable, exactly as before.
+  const down = await fetchJd('https://jobs.ashbyhq.com/acme/j1', {
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  eq('fetchJd: a 404 on the SHARED board is still retryable, never a per-job closure', down.reason, 'http_404');
+}
+
+// ── lever publishes the salary in its own field ─────────────────────────────
+// Lever splits an ad across descriptionPlain, lists[], additionalPlain AND
+// salaryDescriptionPlain. Dropping the last one made the scorer report "no
+// advertised salary figure" for roles that publish a real band, which feeds
+// straight into the report's advertised_comp field.
+{
+  const got = extractJdText('lever', {
+    descriptionPlain: 'About the role',
+    lists: [{ text: 'Requirements', content: '<li>Python</li>' }],
+    salaryDescriptionPlain: 'The base salary range for this role is $182,000 - $257,000.',
+    additionalPlain: 'We are an equal opportunity employer.',
+  });
+  has('extractJdText: lever keeps the advertised salary band', got, '$182,000 - $257,000');
+  has('extractJdText: lever still keeps the intro', got, 'About the role');
+  has('extractJdText: lever still keeps the closing section', got, 'equal opportunity');
+}
+eq('extractJdText: lever with no salary field is unchanged',
+  extractJdText('lever', { descriptionPlain: 'Just an intro' }), 'Just an intro');
+
+// ── greenhouse job-board URLs that carry the id as ?gh_jid= ────────────────
+// 64 llm_ready rows (Stripe, Coinbase, Databricks, Airbnb, Waymo, Block...)
+// host their board on their OWN domain and pass the posting id as a gh_jid
+// query param. detailApiFor only matched greenhouse.io hosts, so every one of
+// them was written off 'unsupported' — a permanent, silent loss of exactly the
+// employers most worth applying to.
+eq('detailApiFor: a gh_jid URL maps to the greenhouse API when the board token is known',
+  detailApiFor('https://boards.greenhouse.io/embed/job_app?for=acme&gh_jid=12345', { boardToken: 'acme' })?.api,
+  'https://boards-api.greenhouse.io/v1/boards/acme/jobs/12345');
+eq('detailApiFor: a gh_jid URL on the company\'s own domain still resolves',
+  detailApiFor('https://stripe.com/jobs/listing/analyst?gh_jid=6789', { boardToken: 'stripe' })?.api,
+  'https://boards-api.greenhouse.io/v1/boards/stripe/jobs/6789');
+eq('detailApiFor: gh_jid without a board token stays unsupported (never guessed)',
+  detailApiFor('https://stripe.com/jobs/listing/analyst?gh_jid=6789'), null);
+eq('detailApiFor: a gh_jid URL is a per-job endpoint, so a 404 there IS a closure',
+  detailApiFor('https://stripe.com/jobs/x?gh_jid=1', { boardToken: 'stripe' })?.shared, false);
+eq('detailApiFor: a non-numeric gh_jid is not trusted',
+  detailApiFor('https://stripe.com/jobs/x?gh_jid=../../etc', { boardToken: 'stripe' }), null);
+
+// ── a guessed board token must never be able to declare a job dead ─────────
+// The gh_jid fallback derives the greenhouse board token from the queue's
+// company slug, which is right about 5 times in 6 (probed live 2026-07-24:
+// stripe, abnormalsecurity, fieldwire, place, clerkie all 200; astspacemobile
+// 404s under its slug). A 404 from a WRONG token is proof the token was wrong,
+// not proof the posting closed — and the per-job 404 rule would otherwise
+// permanently kill a live job over a naming mismatch. Derived endpoints are
+// therefore marked, and their 404 degrades to unsupported instead of 'gone'.
+eq('detailApiFor: a gh_jid endpoint is marked derived (its token was inferred)',
+  detailApiFor('https://stripe.com/jobs/x?gh_jid=1', { boardToken: 'stripe' })?.derived, true);
+eq('detailApiFor: a real greenhouse.io URL is NOT derived (its token is in the URL)',
+  detailApiFor('https://job-boards.greenhouse.io/acme/jobs/1')?.derived, false);
+{
+  const notFound = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  const derived = await fetchJd('https://ast-science.com/careers?gh_jid=4716870005', {
+    fetchImpl: notFound, boardToken: 'astspacemobile',
+  });
+  eq('fetchJd: a 404 from a GUESSED board token is unsupported, never a closure', derived.reason, 'unsupported');
+
+  const real = await fetchJd('https://job-boards.greenhouse.io/acme/jobs/1', { fetchImpl: notFound });
+  eq('fetchJd: a 404 from a URL-supplied token IS still a closure', real.reason, 'gone');
+}
+{
+  const ok = async () => ({ ok: true, status: 200, json: async () => ({ content: '<p>Real ad</p>' }) });
+  const r = await fetchJd('https://stripe.com/jobs/search?gh_jid=8075469', { fetchImpl: ok, boardToken: 'stripe' });
+  eq('fetchJd: a gh_jid posting with a good token fetches its ad', r.ok, true);
+  has('fetchJd: the recovered ad carries real text', r.text, 'Real ad');
+}

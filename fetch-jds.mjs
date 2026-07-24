@@ -69,7 +69,13 @@ async function handle(row) {
   // Decided BEFORE the limiter: a site with no known endpoint issues no
   // request, so routing it through the limiter would book a request that never
   // happened and quietly corrupt the throttling report this run is judged by.
-  if (!detailApiFor(url)) {
+  // The queue's company slug doubles as the greenhouse board token for boards
+  // hosted on a company's own domain (?gh_jid=...). Probed live 2026-07-24 it is
+  // right about 5 times in 6, and a wrong guess degrades to 'unsupported' rather
+  // than to a false closure (see jd-fetch's `derived` handling), so offering it
+  // can only recover rows, never lose them.
+  const boardToken = String(row.company || '').trim();
+  if (!detailApiFor(url, { boardToken })) {
     markJdFailure(db, url, 'unsupported');
     tally.unsupported++;
     reasons.unsupported = (reasons.unsupported || 0) + 1;
@@ -79,7 +85,7 @@ async function handle(row) {
   let result;
   try {
     result = await limiter.run(url, async () => {
-      const out = await fetchJd(url, { cache: boardCache, fetchImpl: countingFetch });
+      const out = await fetchJd(url, { cache: boardCache, fetchImpl: countingFetch, boardToken });
       // fetchJd reports throttling as a plain result; the limiter only learns
       // from a THROWN error carrying .status, so re-raise those two codes to
       // close the feedback loop that halves the window.

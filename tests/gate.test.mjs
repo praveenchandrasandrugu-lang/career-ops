@@ -17,7 +17,7 @@
  */
 import { pass, fail } from './helpers.mjs';
 import { openQueue, upsertJobs, listReady } from '../queue.mjs';
-import { classifyLocation, classifyLevel, runGate } from '../gate.mjs';
+import { classifyLocation, classifyLocationDeep, classifyLevel, runGate } from '../gate.mjs';
 
 const T = (label, cond) => (cond ? pass(label) : fail(label, 'assertion failed'));
 const eq = (label, got, want) => T(`${label}${got === want ? '' : ` (got ${JSON.stringify(got)})`}`, got === want);
@@ -298,3 +298,86 @@ async function gateTests() {
 }
 
 await gateTests();
+
+// ── the two-letter code collision: IN is India as often as Indiana ─────────
+//
+// Found on the live queue 2026-07-24: "Hyderabad - TS - IN" — Workday's
+// city-state-country format for an Indian posting — classified as **us**,
+// because US_STATE_RE matched "IN" for Indiana. Not merely unknown: a
+// confident FALSE US, which sails through the gate and reaches the paid
+// scorer. 65 rows in the scoreable pool named a foreign city this way.
+//
+// The collision is broad, not a one-off: IN is Indiana and India, DE is
+// Delaware and Germany, CA is California and Canada.
+//
+// The fix keeps the "any US signal wins" doctrine that protects multi-location
+// postings, and narrows only the AMBIGUOUS signal: a bare two-letter code is
+// the weakest US evidence there is, so an explicit foreign city or country
+// name in the same string outranks it. A spelled-out US city, state name, or
+// "US"/"USA" still wins outright.
+eq('classifyLocation: Workday city-state-country for India is non-US, not Indiana',
+  classifyLocation('Hyderabad - TS - IN'), 'non_us');
+eq('classifyLocation: an IN-prefixed Indian location is non-US',
+  classifyLocation('IN KA Bengaluru'), 'non_us');
+eq('classifyLocation: Berlin, DE is Germany, not Delaware',
+  classifyLocation('Berlin, DE'), 'non_us');
+eq('classifyLocation: Toronto, CA is Canada, not California',
+  classifyLocation('Toronto, CA'), 'non_us');
+
+// ...but a real US posting that happens to use those same codes still reads US.
+eq('classifyLocation: Indianapolis, IN is still Indiana', classifyLocation('Indianapolis, IN'), 'us');
+eq('classifyLocation: a bare state code with no foreign signal is still US',
+  classifyLocation('Fort Wayne, IN'), 'us');
+eq('classifyLocation: Wilmington, DE is still Delaware', classifyLocation('Wilmington, DE'), 'us');
+
+// ...and the multi-location rule the doctrine exists to protect is untouched:
+// a posting offering a workable US site must never be skipped.
+eq('classifyLocation: London / Boston still offers a US site',
+  classifyLocation('London, UK / Boston, MA'), 'us');
+eq('classifyLocation: a foreign city plus an explicit US state name is US',
+  classifyLocation('Bangalore, India; Austin, Texas'), 'us');
+eq('classifyLocation: a foreign city plus "Remote - US" is US',
+  classifyLocation('Bengaluru / Remote - US'), 'us');
+
+// ── the "N Locations" placeholder: resolve geography from the ad ───────────
+//
+// Workday's most common location value is a bare count ("2 Locations",
+// "6 Locations"), which names nothing. 394 of the 921 scoreable rows carry a
+// placeholder or empty location, so the gate can only answer `unknown` for
+// them — correctly, since it runs before the ad is downloaded and its rule is
+// that unknown always passes.
+//
+// By the SCREEN stage the ad exists, so the same question can be asked with
+// real evidence. classifyLocationDeep reads the location field, the decoded
+// URL path (Workday encodes the office into it) and the head of the ad. The
+// asymmetry is unchanged: only a positive foreign signal with NO US signal
+// anywhere gates a row.
+{
+  const deep = (row) => classifyLocationDeep(row);
+
+  eq('classifyLocationDeep: a placeholder location resolves from the URL path',
+    deep({ location: '6 Locations', canonical_url: 'https://x.wd1.myworkdayjobs.com/c/job/Bangalore-India/Analyst_R1', jd_text: '' }),
+    'non_us');
+  eq('classifyLocationDeep: a placeholder location resolves from the ad text',
+    deep({ location: '2 Locations', canonical_url: 'https://x.wd1.myworkdayjobs.com/c/job/R1', jd_text: 'This role is based in our Hyderabad office.' }),
+    'non_us');
+  eq('classifyLocationDeep: an explicit US location still wins over a foreign mention in the ad',
+    deep({ location: 'Austin, TX', canonical_url: 'https://x/job/R1', jd_text: 'You will partner with our Bangalore team.' }),
+    'us');
+  eq('classifyLocationDeep: a US signal ANYWHERE keeps the row (a US site is workable)',
+    deep({ location: '3 Locations', canonical_url: 'https://x/job/Bangalore-India/R1', jd_text: 'Offices in Bengaluru and Austin, Texas.' }),
+    'us');
+  eq('classifyLocationDeep: no signal at all stays unknown, and unknown always passes',
+    deep({ location: '2 Locations', canonical_url: 'https://x/job/R1', jd_text: 'We are hiring an analyst.' }),
+    'unknown');
+  eq('classifyLocationDeep: a URL-encoded foreign office is decoded before matching',
+    deep({ location: '', canonical_url: 'https://x.wd1.myworkdayjobs.com/c/job/M%C3%BCnchen-Germany/Analyst', jd_text: '' }),
+    'non_us');
+  // Only the HEAD of the ad is read: an EEO footer naming global offices at the
+  // bottom of a US posting must not drag it out of the queue.
+  eq('classifyLocationDeep: a boilerplate footer far below the ad head is not evidence',
+    deep({ location: '2 Locations', canonical_url: 'https://x/job/R1', jd_text: `We are hiring an analyst.${' filler'.repeat(400)} Our offices include Bangalore.` }),
+    'unknown');
+  // Missing/garbage input must never throw — this runs over every queued row.
+  eq('classifyLocationDeep: an empty row is unknown, not a crash', deep({}), 'unknown');
+}

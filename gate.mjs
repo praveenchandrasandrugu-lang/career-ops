@@ -127,8 +127,74 @@ const FOREIGN_CITY_RE = anyWord(FOREIGN_CITIES);
 export function classifyLocation(text) {
   const s = String(text ?? '').trim();
   if (!s) return 'unknown';
-  if (US_STATE_RE.test(s) || US_NAME_RE.test(s) || US_BARE_RE.test(s) || US_CITY_RE.test(s)) return 'us';
-  if (FOREIGN_NAME_RE.test(s) || FOREIGN_CODE_RE.test(s) || FOREIGN_CITY_RE.test(s)) return 'non_us';
+
+  // An UNAMBIGUOUS US signal still wins outright, which is what keeps a
+  // multi-location posting like "London, UK / Boston, MA" in the queue.
+  if (US_NAME_RE.test(s) || US_BARE_RE.test(s) || US_CITY_RE.test(s)) return 'us';
+
+  // A bare two-letter state code is the one AMBIGUOUS US signal, because the
+  // same two letters are country codes: IN is India as well as Indiana, DE is
+  // Germany as well as Delaware, CA is Canada as well as California. Found on
+  // the live queue 2026-07-24, Workday's "Hyderabad - TS - IN" was classified
+  // `us` on the strength of that "IN" — not merely unknown, but a confident
+  // FALSE US that passed the gate and reached the paid scorer. 65 rows in the
+  // scoreable pool named a foreign city that way.
+  //
+  // So an explicit foreign city or country name outranks a bare code. It cannot
+  // cost a US option: every unambiguous US signal was already checked above, so
+  // reaching here means the string's ONLY claim to being US was two letters.
+  const foreign = FOREIGN_NAME_RE.test(s) || FOREIGN_CODE_RE.test(s) || FOREIGN_CITY_RE.test(s);
+  if (foreign) return 'non_us';
+  if (US_STATE_RE.test(s)) return 'us';
+  return 'unknown';
+}
+
+/**
+ * How much of the ad counts as evidence of where the job IS.
+ *
+ * A job ad states its location near the top; a global-offices list or an EEO
+ * footer sits at the bottom. Reading the whole ad would let that boilerplate
+ * drag a genuinely US posting out of the queue, so only the head is evidence.
+ */
+const AD_HEAD_CHARS = 1200;
+
+/**
+ * classifyLocation with the evidence that only exists AFTER the ad is fetched.
+ *
+ * Workday's most common location value is a bare count — "2 Locations",
+ * "6 Locations" — which names nothing at all. On the live queue 2026-07-24 that
+ * left 394 of 921 scoreable rows as `unknown`, and since `unknown` always
+ * passes (correctly: gate.mjs runs before any ad exists), every one of them was
+ * queued for paid scoring with its geography unexamined. 65 of them named a
+ * foreign city somewhere in their URL or ad.
+ *
+ * By the screen stage the ad is downloaded, so the same question can be asked
+ * with real evidence: the location field, the DECODED URL path (Workday encodes
+ * the office into it, percent-escaped), and the head of the ad.
+ *
+ * The asymmetry is unchanged from gate.mjs: a US signal anywhere keeps the row,
+ * because a multi-site posting with a workable US office is worth a look, and
+ * only a positive foreign signal with no US signal at all resolves to non_us.
+ *
+ * @param {{location?:string, canonical_url?:string, raw_url?:string, jd_text?:string}} row
+ * @returns {'us'|'non_us'|'unknown'}
+ */
+export function classifyLocationDeep(row = {}) {
+  const field = String(row?.location ?? '');
+  // A Workday path carries the office as "/job/Bangalore-India/..." and is
+  // percent-encoded, so "München" only matches once decoded. A malformed escape
+  // must not throw here — this runs over every queued row.
+  let path = String(row?.canonical_url ?? row?.raw_url ?? '');
+  try { path = decodeURIComponent(path); } catch { /* keep the raw form */ }
+  // Slashes, hyphens and underscores are separators in a URL path, and the
+  // word-boundary matcher needs real boundaries to see "Bangalore-India".
+  path = path.replace(/[/_-]+/g, ' ');
+  const head = String(row?.jd_text ?? '').slice(0, AD_HEAD_CHARS);
+
+  const sources = [field, path, head];
+  // Any US signal, from any source, wins — same rule as classifyLocation.
+  if (sources.some((s) => s && classifyLocation(s) === 'us')) return 'us';
+  if (sources.some((s) => s && classifyLocation(s) === 'non_us')) return 'non_us';
   return 'unknown';
 }
 

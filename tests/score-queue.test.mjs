@@ -23,6 +23,7 @@ import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs'
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
+  killTree, staleWindowMs, dedupePool,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
 
@@ -530,4 +531,94 @@ const stateFull = (db, url) => db.prepare('SELECT queue_status, skip_reason, sco
   const res = await processRow(db, row, deps);
   eq('refresh: no refresh dep behaves exactly as before', res.status, 'evaluated');
   eq('refresh: no refresh dep uses the stored ad', calls.jd[0]?.text, 'We need an analyst.');
+}
+
+// ── killTree: on Windows the child is cmd.exe, and codex is its GRANDCHILD ──
+// buildCodexSpawn routes through `cmd.exe /c codex ...` because npm installs
+// codex as a .cmd that spawn(shell:false) cannot launch. A plain child.kill()
+// there terminates only the interpreter — codex survives the timeout, keeps
+// spending on a paid model, and finishes by re-writing the tracker TSV the
+// timeout path had just discarded. So a run the queue recorded as FAILED still
+// posts a tracker row for a job it never really scored.
+{
+  const calls = [];
+  const fakeChild = { pid: 4242, kill: (sig) => calls.push(['signal', sig]) };
+  const spawnImpl = (cmd, args) => { calls.push([cmd, args.join(' ')]); return {}; };
+
+  const win = killTree(fakeChild, { isWin: true, spawnImpl });
+  eq('killTree: Windows kills the whole process tree', win, true);
+  eq('killTree: Windows uses taskkill', calls[0][0], 'taskkill');
+  T('killTree: taskkill targets the child pid with /T (tree) and /F (force)',
+    /4242/.test(calls[0][1]) && /\/T/.test(calls[0][1]) && /\/F/.test(calls[0][1]));
+
+  calls.length = 0;
+  const posix = killTree(fakeChild, { isWin: false, spawnImpl });
+  eq('killTree: POSIX signals the child directly (codex is the child there)', posix, false);
+  eq('killTree: POSIX sends SIGKILL', calls[0]?.join(' '), 'signal SIGKILL');
+
+  // A taskkill that cannot even be spawned must still fall back to the signal,
+  // never leave the worker running unkilled.
+  calls.length = 0;
+  killTree(fakeChild, { isWin: true, spawnImpl: () => { throw new Error('no taskkill'); } });
+  eq('killTree: a failed taskkill still falls back to the direct signal', calls[0]?.join(' '), 'signal SIGKILL');
+
+  // A child that already exited has no pid; this must not throw.
+  let threw = false;
+  try { killTree({ pid: undefined }, { isWin: true, spawnImpl }); } catch { threw = true; }
+  T('killTree: an already-dead child is not an error', !threw);
+}
+
+// ── staleWindowMs: a long run must outlive its own stale window ─────────────
+// reclaimStale's 1h default was written for a crashed run. But a --limit 100
+// batch at concurrency 3 can legitimately run far longer than an hour, and a
+// SECOND invocation would then reclaim rows the first is still actively
+// scoring — two paid Codex workers on one job, and whichever finishes second
+// loses its claim and throws its work away.
+{
+  const hour = 3_600_000;
+  eq('staleWindowMs: a small batch keeps the 1h floor', staleWindowMs({ limit: 3, concurrency: 3 }), hour);
+  T('staleWindowMs: a 100-row batch at concurrency 3 gets a window longer than an hour',
+    staleWindowMs({ limit: 100, concurrency: 3 }) > hour);
+  T('staleWindowMs: the window covers the worst case (every row hitting the 900s timeout)',
+    staleWindowMs({ limit: 100, concurrency: 3 }) >= Math.ceil(100 / 3) * 900_000);
+  T('staleWindowMs: more workers shrinks the window (the batch finishes sooner)',
+    staleWindowMs({ limit: 100, concurrency: 10 }) < staleWindowMs({ limit: 100, concurrency: 3 }));
+  eq('staleWindowMs: nonsense input still yields the 1h floor', staleWindowMs({ limit: 0, concurrency: 0 }), hour);
+}
+
+// ── dedupePool: one employer must never get two applications for one job ────
+// The same posting is routinely reachable at two URLs (a company's own careers
+// domain and its ATS host), which canonicalizeUrl cannot collapse because the
+// hosts genuinely differ. Both rows carry the SAME downloaded ad, so the ad
+// itself is the content key: identical jd_text means identical posting.
+{
+  const rows = [
+    { canonical_url: 'https://a.com/1', jd_text: 'Same ad body', company: 'acme' },
+    { canonical_url: 'https://boards.x.io/acme/2', jd_text: 'Same ad body', company: 'acme' },
+    { canonical_url: 'https://a.com/3', jd_text: 'A different job', company: 'acme' },
+  ];
+  const { unique, duplicates } = dedupePool(rows);
+  eq('dedupePool: identical ads collapse to one row', unique.length, 2);
+  eq('dedupePool: the FIRST (freshest, drain-ordered) occurrence is the one kept', unique[0].canonical_url, 'https://a.com/1');
+  eq('dedupePool: the duplicate is reported, not silently dropped', duplicates.length, 1);
+  eq('dedupePool: the duplicate names the row it duplicates', duplicates[0].duplicateOf, 'https://a.com/1');
+}
+{
+  // Whitespace-only differences are the same ad: one ATS pretty-prints, the
+  // other does not. Matching on exact bytes would miss the real duplicate.
+  const { unique } = dedupePool([
+    { canonical_url: 'u1', jd_text: 'Build  things\n\n Ship them ' },
+    { canonical_url: 'u2', jd_text: 'Build things\nShip them' },
+  ]);
+  eq('dedupePool: whitespace differences do not hide a duplicate', unique.length, 1);
+}
+{
+  // An empty ad is not evidence of anything — collapsing all of them would
+  // delete unrelated jobs. Never dedupe on nothing.
+  const { unique } = dedupePool([
+    { canonical_url: 'u1', jd_text: '' },
+    { canonical_url: 'u2', jd_text: '   ' },
+    { canonical_url: 'u3', jd_text: null },
+  ]);
+  eq('dedupePool: empty ads are never treated as duplicates of each other', unique.length, 3);
 }
