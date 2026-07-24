@@ -23,7 +23,7 @@ import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs'
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
-  killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend, closedReportNums,
+  killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend, closedReportNums, isThinMarketState,
   parseReportHeader, healFromReports,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
@@ -670,6 +670,48 @@ eq('titlePriority: Operations Specialist with no engineering noun is still prima
   const order = orderForSpend(rows).map((r) => r.company).join(',');
   eq('orderForSpend: a hot row still outranks every fresh row, whatever its title', order[0], 'd');
   eq('orderForSpend: within fresh, the Analyst comes before the Engineer', order, 'd,c,a,b');
+}
+// ── thin-market geography, the third key ───────────────────────────────────
+// modes/_profile.md rule 8 asks for a thin-market boost and nothing in the
+// automated path applied it. BLS unemployed-per-opening (Dec 2025, US avg 1.1)
+// is the evidence; everify-check.mjs derives the same set. Boost ONLY: it is
+// the LAST key, so it can never pull a stale row or an engineering title
+// forward, and a state is never a reason to skip a job.
+eq('isThinMarketState: a spelled-out thin state is recognised', isThinMarketState('Fargo, North Dakota'), true);
+eq('isThinMarketState: an uppercase code after a comma is recognised', isThinMarketState('Cedar Rapids, IA'), true);
+eq('isThinMarketState: a Workday dash format is recognised', isThinMarketState('Omaha - NE - USA'), true);
+eq('isThinMarketState: a thick-market state is not', isThinMarketState('San Francisco, CA'), false);
+// AK (1.1, exactly average) and NM (1.3, WORSE than average) failed the BLS
+// test and are not thin, however cold New Mexico winters are not.
+eq('isThinMarketState: Alaska is average, not thin', isThinMarketState('Anchorage, AK'), false);
+eq('isThinMarketState: New Mexico is worse than average, not thin', isThinMarketState('Albuquerque, New Mexico'), false);
+// The two-letter codes in this set are all ordinary English words or ID-field
+// noise. A bare uppercase match with no separator would read every one of these
+// as a thin-market hit.
+eq('isThinMarketState: "Job ID" is not Idaho', isThinMarketState('Remote, USA (Job ID 4471)'), false);
+eq('isThinMarketState: "MS Excel" in a location blob is not Mississippi', isThinMarketState('Austin, TX (MS Excel required)'), false);
+eq('isThinMarketState: lowercase "me" is not Maine', isThinMarketState('Contact me about Boston'), false);
+eq('isThinMarketState: empty is not thin', isThinMarketState(''), false);
+{
+  // Geography sorts LAST: it reorders only rows already equal on freshness and
+  // archetype tier. A thin-market engineering role must not jump an Analyst.
+  const rows = [
+    { title: 'Data Analyst', location: 'New York, NY', freshness: { bucket: 'fresh' }, company: 'nyc-analyst' },
+    { title: 'Software Engineer', location: 'Bismarck, ND', freshness: { bucket: 'fresh' }, company: 'thin-eng' },
+    { title: 'Data Analyst', location: 'Cedar Rapids, IA', freshness: { bucket: 'fresh' }, company: 'thin-analyst' },
+  ];
+  const order = orderForSpend(rows).map((r) => r.company).join(',');
+  eq('orderForSpend: within a bucket and tier, the thin-market row goes first',
+    order, 'thin-analyst,nyc-analyst,thin-eng');
+}
+{
+  // Freshness still leads over geography, exactly as it leads over the tier.
+  const rows = [
+    { title: 'Data Analyst', location: 'Fargo, ND', freshness: { bucket: 'backup' }, company: 'thin-old' },
+    { title: 'Data Analyst', location: 'Chicago, IL', freshness: { bucket: 'hot' }, company: 'thick-hot' },
+  ];
+  eq('orderForSpend: a hot thick-market row still outranks a backup thin-market row',
+    orderForSpend(rows)[0].company, 'thick-hot');
 }
 {
   // A stable sort: two rows in the same bucket AND tier keep their input order,

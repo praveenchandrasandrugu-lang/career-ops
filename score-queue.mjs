@@ -555,6 +555,58 @@ export function titlePriority(title) {
 
 const BUCKET_RANK = { hot: 0, fresh: 1, backup: 2, unknown: 3, stale: 4 };
 
+// ── thin-market geography ──────────────────────────────────────────────────
+//
+// States where BLS reports FEWER unemployed people per job opening than the US
+// average of 1.1 (seasonally adjusted, Dec 2025) — the employer is competing
+// for the candidate rather than the reverse. everify-check.mjs derives the same
+// set from its TIGHTNESS table; this mirrors the result rather than importing
+// it, because that module loads a 961k-row employer index at import time.
+//
+// AK (1.1, exactly average) and NM (1.3, WORSE than average) are deliberately
+// ABSENT. They were in the original hand-written "harsh weather" list, which
+// was folk reasoning: cold winters correlate with thin labor markets but the
+// labor-market number is the thing that matters. modes/_profile.md rule 8 still
+// names both; the data does not support them.
+//
+// Honest limit: BLS measures overall market tightness, NOT applicants-per-
+// posting for analyst roles. This is a well-grounded prior, not proof.
+const THIN_MARKET_STATES = ['ND', 'SD', 'OK', 'ID', 'ME', 'MS', 'MT', 'NE', 'VT', 'WV', 'AR', 'IA', 'KS', 'WY'];
+const THIN_MARKET_NAMES = [
+  'north dakota', 'south dakota', 'oklahoma', 'idaho', 'maine', 'mississippi',
+  'montana', 'nebraska', 'vermont', 'west virginia', 'arkansas', 'iowa',
+  'kansas', 'wyoming',
+];
+const THIN_NAME_RE = new RegExp(`(?:^|[^\\p{L}])(?:${THIN_MARKET_NAMES.join('|')})(?:[^\\p{L}]|$)`, 'iu');
+// The two-letter codes here are unusually hostile: ID, ME, OK, MS, NE and IA
+// are all ordinary English words or ID-field noise ("Job ID 4471", "MS Excel",
+// "contact me"). So a code counts only when it is UPPERCASE (real postings
+// write state codes uppercase) AND follows a location separator — the "City,
+// ST" and "City - ST - USA" shapes every ATS emits. A bare uppercase match with
+// no separator reads "Remote, USA (Job ID 4471)" as Idaho.
+// ...and it must also END a segment: a state code is followed by the end of the
+// string, another separator, or a ZIP. "MS Excel" opens with the same separator
+// and uppercase code as ", MS" but continues into a word, so the trailing
+// lookahead is what tells Mississippi from a spreadsheet.
+const THIN_CODE_RE = new RegExp(`[,\\-–—/(]\\s*(?:${THIN_MARKET_STATES.join('|')})(?=\\s*(?:$|[,\\-–—/)]|\\d))`, 'u');
+
+/**
+ * Does a posting's location name a thin-market state?
+ *
+ * A BOOST signal only. It is the last sort key in orderForSpend and nothing
+ * anywhere filters on it: modes/_profile.md rule 8 is explicit that geography
+ * is "a positive nudge when ranking what to evaluate/apply to — never a penalty
+ * for other states". A false positive costs one slightly-misordered row.
+ *
+ * @param {unknown} location  a posting's location field
+ * @returns {boolean}
+ */
+export function isThinMarketState(location) {
+  const s = String(location ?? '').trim();
+  if (!s) return false;
+  return THIN_NAME_RE.test(s) || THIN_CODE_RE.test(s);
+}
+
 /**
  * Order a scoreable pool by what is worth spending a model on first.
  *
@@ -574,7 +626,12 @@ export function orderForSpend(rows = []) {
   return (Array.isArray(rows) ? [...rows] : []).sort((a, b) => {
     const bucket = (BUCKET_RANK[a?.freshness?.bucket] ?? 3) - (BUCKET_RANK[b?.freshness?.bucket] ?? 3);
     if (bucket !== 0) return bucket;
-    return titlePriority(a?.title) - titlePriority(b?.title);
+    const tier = titlePriority(a?.title) - titlePriority(b?.title);
+    if (tier !== 0) return tier;
+    // Geography sorts LAST, so it only separates rows already equal on
+    // freshness and archetype tier. It must never pull a stale row or an
+    // engineering title forward — fit and recency both outrank competition.
+    return Number(isThinMarketState(b?.location)) - Number(isThinMarketState(a?.location));
   });
 }
 
