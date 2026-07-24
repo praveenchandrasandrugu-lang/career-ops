@@ -22,7 +22,7 @@ import { pass, fail } from './helpers.mjs';
 import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs';
 import {
   bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
-  setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom,
+  setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
 } from '../score-queue.mjs';
 import { reclaimStale } from '../queue.mjs';
 
@@ -371,6 +371,24 @@ eq('exitCodeFrom: a clean exit 0 stays 0', exitCodeFrom(0, null), 0);
 eq('exitCodeFrom: a real non-zero code passes through', exitCodeFrom(1, null), 1);
 T('exitCodeFrom: a SIGKILL (code null, signal set) is non-zero', exitCodeFrom(null, 'SIGKILL') !== 0);
 T('exitCodeFrom: a null code with no signal is still treated as failure', exitCodeFrom(null, null) !== 0);
+
+// ── buildCodexSpawn: run the codex.cmd shim on Windows ──────────────────────
+// npm installs codex as codex.cmd on Windows; spawn() with shell:false can't
+// launch a .cmd (it never applies PATHEXT), which is exit 127. Route through
+// the command interpreter on Windows, direct exec everywhere else. Node still
+// auto-quotes argv when shell:false, so a path with a space survives.
+{
+  const args = ['exec', '-s', 'workspace-write', '-C', 'C:/Users/John Doe/repo', '-o', '/tmp/x y.txt', '-'];
+  const posix = buildCodexSpawn(args, { isWin: false });
+  eq('buildCodexSpawn: POSIX runs codex directly', posix.cmd, 'codex');
+  T('buildCodexSpawn: POSIX passes args through untouched', posix.spawnArgs.join('') === args.join(''));
+
+  const win = buildCodexSpawn(args, { isWin: true, comspec: 'C:/Windows/System32/cmd.exe' });
+  eq('buildCodexSpawn: Windows routes through the command interpreter', win.cmd, 'C:/Windows/System32/cmd.exe');
+  eq('buildCodexSpawn: Windows prefixes /c codex', win.spawnArgs.slice(0, 2).join(' '), '/c codex');
+  T('buildCodexSpawn: Windows forwards every original arg (spaces intact, no manual quoting)',
+    win.spawnArgs.slice(2).join('') === args.join(''));
+}
 
 // garbage stdout with no parseable payload is a failure, not a crash
 {

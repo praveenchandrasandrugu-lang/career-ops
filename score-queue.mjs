@@ -403,6 +403,23 @@ export function addScoreColumns(db) {
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Decide how to spawn `codex`. npm installs it as `codex.cmd` on Windows, and
+ * spawn() with shell:false cannot launch a `.cmd` (it never applies PATHEXT) —
+ * that is the exit-127 ENOENT. So on Windows the command is run through the
+ * command interpreter (`cmd.exe /c codex ...`); everywhere else codex is exec'd
+ * directly. Kept shell:false in both cases, so Node still auto-quotes each argv
+ * entry and a path containing a space survives without any manual quoting.
+ *
+ * @param {string[]} args  the codex arguments (after the program name)
+ * @returns {{cmd:string, spawnArgs:string[]}}
+ */
+export function buildCodexSpawn(args, { isWin = process.platform === 'win32', comspec = process.env.ComSpec || 'cmd.exe' } = {}) {
+  return isWin
+    ? { cmd: comspec, spawnArgs: ['/c', 'codex', ...args] }
+    : { cmd: 'codex', spawnArgs: args };
+}
+
+/**
  * The real Codex worker. Feeds the filled batch-prompt.md to `codex exec` on
  * stdin and captures the agent's final message via `-o` (a clean single-message
  * file, so parseFinalJson never has to fish the payload out of Codex's own event
@@ -422,8 +439,8 @@ function codexRunWorker(prompt, { cwd = HERE, timeoutMs = 900_000, fullAccess = 
     const sandbox = fullAccess
       ? ['--dangerously-bypass-approvals-and-sandbox']
       : ['-s', 'workspace-write'];
-    const args = ['exec', ...sandbox, '-C', cwd, '-o', outFile, '-'];
-    const child = spawn('codex', args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    const { cmd, spawnArgs } = buildCodexSpawn(['exec', ...sandbox, '-C', cwd, '-o', outFile, '-']);
+    const child = spawn(cmd, spawnArgs, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', done = false;
     const finish = (code) => {
       if (done) return; done = true;
