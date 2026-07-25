@@ -86,6 +86,37 @@ Run these steps in order.
 2. If the file is empty or missing, try to fetch the JD from `{{URL}}` with WebFetch.
 3. If both fail, write a failed final JSON payload and stop.
 
+### Step 1b — Hard-reject check, BEFORE spending anything
+
+Read `modes/_profile.md` and `config/profile.yml` first, then scan the ad for a
+bar the candidate cannot clear by being hired. If you find one, emit the
+`skipped` payload from Step 6 and STOP. Do not write a report, a PDF, or a
+tracker line. The free regex screens upstream catch most of these; this exists
+for the ones only a reader can see.
+
+A hard reject is a demand that is **impossible**, not merely unfavourable:
+
+- US citizenship, permanent residency, or a security clearance in any form,
+  **including one the ad says is obtainable after hire** — obtaining a US
+  clearance requires citizenship, so "able to obtain" is a wall, not a runway.
+- An active professional licence or named certification he does not hold and
+  cannot obtain before applying (RN, CPA, PE, bar admission, Epic certification).
+- A graduation cohort he is not in, or enrolment he does not have.
+- A hard experience floor with no route around it, stated as a requirement
+  rather than a preference.
+- The role is not in the United States.
+
+**This list is exhaustive. Anything else is a SCORE, not a skip.** A role that
+is merely senior, a weak archetype match, an unappealing domain, low pay, or
+outside his target titles must still be evaluated and scored — that is what the
+score is FOR, and a low score is a useful answer. Skipping is only for questions
+already settled by fact.
+
+When the evidence is ambiguous, **score it**. A wrongly scored job costs one
+evaluation; a wrongly skipped job is a job he never sees, and he never finds out
+it existed. Those two errors are not the same size. `skip_reason` must quote the
+exact line from the ad, so every skip can be audited later.
+
 ### Step 2 — Evaluate A-G
 
 Read `cv.md`, `article-digest.md`, `llms.txt`, `modes/_profile.md`, and `config/profile.yml`. Then complete every block below.
@@ -183,26 +214,17 @@ Comp score:
 - 2 = slightly below market
 - 1 = clearly below market
 
-#### Block E — Personalization Plan
-
-Provide a table:
-
-| # | Section | Current state | Proposed change | Why |
-|---|---------|---------------|------------------|-----|
-
-Include top CV changes and LinkedIn/profile framing changes.
-
-#### Block F — Interview Plan
-
-Provide 6-10 STAR+R stories mapped to JD requirements:
-
-| # | JD requirement | STAR+R story | S | T | A | R | Reflection |
-|---|----------------|--------------|---|---|---|---|------------|
-
-Also include:
-
-- one recommended case study
-- likely red-flag questions and how to answer them
+> **Blocks E and F are deliberately absent (2026-07-24, candidate's call).**
+> E was a personalization plan and F was 6-10 STAR+R interview stories, written
+> for EVERY evaluated role including the ones scoring 1.8 that will never be
+> applied to. Neither feeds anything downstream: Step 4's CV generation extracts
+> its own JD keywords from `cv.md` and `article-digest.md` and never read Block
+> E, and the STAR bank is written by the `interview` mode on a real invite, not
+> by this prompt. Interview prep is generated on demand, when there is an
+> interview. Do not restore them on a system update.
+>
+> Block G keeps its letter rather than being renamed E, so the `**Legitimacy:**`
+> header convention and every report already on disk stay consistent.
 
 #### Block G — Posting Legitimacy
 
@@ -336,8 +358,6 @@ Then include:
 - `## B) CV Match`
 - `## C) Level and Strategy`
 - `## D) Compensation and Demand`
-- `## E) Personalization Plan`
-- `## F) Interview Plan`
 - `## G) Posting Legitimacy`
 - `## Extracted Keywords`
 
@@ -475,6 +495,24 @@ Success:
 ```
 
 `pdf_path_json_string_or_null` means either a properly JSON-encoded path string or the native JSON value `null`; never emit the string `"null"`.
+
+Early skip (see Step 0). No report, no PDF, no tracker line:
+
+```json
+{
+  "status": "skipped",
+  "id": "{{ID}}",
+  "report_num": "{{REPORT_NUM}}",
+  "company": "{company_or_unknown}",
+  "role": "{role_or_unknown}",
+  "score": null,
+  "legitimacy": null,
+  "pdf": null,
+  "report": null,
+  "skip_reason": "{the exact bar, quoted from the ad}",
+  "error": null
+}
+```
 
 Failure:
 
