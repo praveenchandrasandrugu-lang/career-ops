@@ -168,7 +168,7 @@
 
   /* === WORK EXPERIENCE === */
   .job {
-    margin-bottom: 14px;
+    margin-bottom: 10px;
   }
 
   .job-header {
@@ -192,28 +192,44 @@
     white-space: nowrap;
   }
 
+  /* Role and location share one line. Stacking company / role / location as three
+     separate block lines spent roughly 60px of a one-page budget on header
+     furniture for every job, which is what squeezed roles down to a single bullet
+     each. Inlining these two hands that line back to actual content. */
   .job-role {
+    display: inline;
     font-size: 11px;
     font-weight: 600;
     color: #1a1a1a;
-    margin-bottom: 6px;
   }
 
   .job-location {
+    display: inline;
     font-size: 10px;
+    color: #444;
+  }
+
+  /* Separator only exists when a location was supplied, because the builder omits
+     the whole element otherwise. */
+  .job-location::before {
+    content: '\00b7\00a0';
     color: #444;
   }
 
   .job ul {
     padding-left: 18px;
-    margin-top: 6px;
+    margin-top: 4px;
   }
 
+  /* Inter-bullet gap trimmed from 4px to 2px. Line-height stays at 1.6 so each
+     bullet is still comfortable to read; what goes away is dead space BETWEEN
+     bullets, which is what a one-bullet-per-role layout never needed and a
+     three-bullet-per-role layout pays for three times over. */
   .job li {
     font-size: 10.5px;
     line-height: 1.6;
     color: #1a1a1a;
-    margin-bottom: 4px;
+    margin-bottom: 2px;
   }
 
   .job li strong {

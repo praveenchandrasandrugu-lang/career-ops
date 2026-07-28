@@ -18,6 +18,9 @@ data/parser-output/**/*.json
 !data/parser-output/.gitkeep
 !data/parser-output/**/.gitkeep
 data/cache/ats-companies/
+# Point-in-time backups of the queue/tracker taken before a destructive reset.
+# These are copies of already-ignored personal data, so the whole dir is ignored.
+data/archive/
 # Received offers/contracts, promise notes, prep reports (PII — never commit)
 data/offers/*
 !data/offers/.gitkeep
