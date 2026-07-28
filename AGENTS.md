@@ -126,6 +126,7 @@ AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluat
 | `data/blacklist.md` | Your do-not-apply company list (user layer, opt-in — never auto-populated; respected by `scan.mjs` and the `auto-pipeline`/`oferta`/`apply` gates) |
 | `scan.mjs` | Zero-token portal scanner — hits Greenhouse/Ashby/Lever APIs directly, zero LLM cost |
 | `scan-ats-full.mjs` | Reverse-ATS keyword-first scanner — walks the full public job-board-aggregator dataset per ATS provider (Greenhouse/Lever/Ashby/Workday), filtered by portals.yml's title_filter/location_filter. No company-list curation needed; complements scan.mjs's company-first model. |
+| `reset-pool.mjs` | Discards the pending job pool and starts from an empty one (`--apply`; dry run by default). **Clearing `data/queue.db` alone does nothing** — it is a derived view that `queue-migrate.mjs` rebuilds from `data/pipeline.md`, so the stale pool silently returns on the next run. This clears both and archives them to `data/archive/`. Keeps `data/scan-history.tsv` and `data/applications.md` on purpose, so the refill cannot replay postings already seen or already applied to. |
 | `check-liveness.mjs` | Job posting liveness checker |
 | `liveness-core.mjs` | Shared liveness logic (expired signals win over generic Apply text) |
 | `reports/` | Evaluation reports (format: `{###}-{company-slug}-{YYYY-MM-DD}.md`). Blocks A-D + G (Posting Legitimacy; E and F were cut 2026-07-24). Header includes `**Legitimacy:** {tier}`. |
