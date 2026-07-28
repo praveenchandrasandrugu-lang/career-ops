@@ -974,7 +974,20 @@ async function main() {
   // The scoreable pool: drain order (freshest first), but only rows that carry
   // an ad. jd_status !== 'ok' can never be scored, and its freshness could
   // otherwise float it to the top and starve rows that CAN be scored.
-  const raw = listReady(db, {}).filter((r) => r.jd_status === 'ok');
+  // --url pins the batch to one posting. The normal path picks by freshness and
+  // tier, so there is otherwise no way to re-score a specific row (e.g. one whose
+  // report was lost when a run was killed) without draining everything ahead of it.
+  const onlyUrl = flag('--url', null);
+  let raw = listReady(db, {}).filter((r) => r.jd_status === 'ok');
+  if (onlyUrl) {
+    const want = canonicalizeUrl(onlyUrl);
+    raw = raw.filter((r) => r.canonical_url === want || r.raw_url === onlyUrl);
+    if (!raw.length) {
+      console.error(`--url matched no scoreable row. The row must be queue_status='llm_ready' with jd_status='ok'.`);
+      console.error(`  looked for: ${want}`);
+      process.exit(1);
+    }
+  }
   // The same posting is routinely reachable at two URLs (a company's own careers
   // domain and its ATS host), which canonicalizeUrl cannot collapse because the
   // hosts genuinely differ. Both rows carry the same ad, so the ad is the key.

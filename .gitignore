@@ -133,3 +133,8 @@ portals-harsh.yml
 
 # Batch working manifests (per-run job lists, not system code)
 batch/*-manifest.json
+
+# Local scratch scripts and their outputs. These embed real CV content (name,
+# phone, email) to build tailored PDFs, so they must never reach a public fork.
+tmp/
+.tmp/
