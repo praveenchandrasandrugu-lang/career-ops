@@ -6,7 +6,19 @@ question: **how well does this candidate's CV match this job's requirements?**
 Everything that is only useful *after* he decides to apply has been removed on
 purpose: compensation research, market benchmarking, negotiation questions, level
 strategy, and web research of any kind. Those live in the `apply` step now. Do not
-reintroduce them. **Make no web calls.**
+reintroduce them. **Make no web calls for research.**
+
+**Two local commands are required and are NOT web calls.** Both read indexes on
+disk and cost no tokens, so the no-research rule above does not apply to them:
+
+- `node everify-check.mjs check <company>` — mandatory on every evaluation. This is
+  the candidate's hard employer gate (he is on F-1 STEM OPT and needs an employer
+  with an open E-Verify account), and `modes/_custom.md` and `modes/_profile.md`
+  both require it. Put the verdict in the report header as
+  `**E-Verify:** {ENROLLED | TERMINATED | NOT FOUND}`. TERMINATED is a hard flag:
+  say so in the tracker note. NOT FOUND is unknown, never an auto-reject — add
+  "ask recruiter: are you enrolled in E-Verify?" to `next_action`.
+- The single WebFetch fallback in Step 1, only when the local JD file failed.
 
 This prompt is self-contained. Do not depend on any slash command, skill, or mode
 file at runtime.
@@ -25,18 +37,24 @@ because rejecting on the ad alone costs the ad plus this prompt while rejecting 
 loading the candidate's full context costs roughly three times as much. 22 rows in the
 live queue were rejected the expensive way before this ordering existed.
 
-**Stage 1 — judgeable from the ad alone. Read nothing else first.** These two need no
-knowledge of the candidate, and on the live queue they are the two most common hard
-rejects (29 citizenship/clearance, 31 non-US in the last screen pass):
+**Stage 1 — the ad plus his work-authorization status.** Read `config/profile.yml`
+(only ~6KB, and Step 2 needs it regardless) and nothing else yet. Do NOT read `cv.md`,
+`modes/_profile.md`, or `modes/_custom.md` at this point — those are the bulk of the
+input cost. On the live queue these are the two most common hard rejects (29
+citizenship/clearance, 31 non-US in the last screen pass):
 
-- US citizenship, permanent residency, or a security clearance in any form,
-  **including one the ad says is obtainable after hire** — obtaining a US clearance
-  requires citizenship, so "able to obtain" is a wall, not a runway.
+- A work-authorization bar he fails. Resolve his actual status from
+  `config/profile.yml` first; do not assume. **The distinction matters and getting it
+  backwards throws away good jobs:** on F-1 STEM OPT he is already work-authorized
+  without sponsorship, so a plain "we do not sponsor" line is **NOT** a reject and
+  must be scored. What IS a reject is a demand he cannot satisfy at all — US
+  citizenship, permanent residency, "permanent/unrestricted work authorization", or a
+  security clearance in any form, **including one the ad says is obtainable after
+  hire**, since obtaining a US clearance requires citizenship.
 - The role is not in the United States.
 
-**Stage 2 — needs the candidate.** Only if Stage 1 found nothing, read `cv.md` and
-`config/profile.yml` (you need them for Step 2 anyway, so this costs nothing extra),
-then check:
+**Stage 2 — needs the CV.** Only if Stage 1 found nothing, read `cv.md` (Step 2 needs
+it anyway, so this costs nothing extra), then check:
 
 - An active professional licence or named certification he does not hold and cannot
   obtain before applying (RN, CPA, PE, bar admission, Epic certification). Judge
@@ -62,7 +80,7 @@ tracker line, no PDF. `skip_reason` must quote the exact line from the ad.
 
 ## Step 2 — Finish loading the candidate, detect the archetype silently
 
-You already read `cv.md` and `config/profile.yml` for Stage 2 above. Now also read
+You already read `config/profile.yml` (Stage 1) and `cv.md` (Stage 2). Now also read
 `modes/_profile.md` (if present), and `modes/_custom.md` for its **House Rules** and
 **Output Preferences** sections only.
 
@@ -141,6 +159,7 @@ lowercase, hyphenated and filesystem-safe.
 **Archetype:** {detected}
 **Score:** {X.X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
+**E-Verify:** {ENROLLED | TERMINATED | NOT FOUND}
 **URL:** {{URL}}
 **PDF:** {path if generated, otherwise `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}

@@ -880,14 +880,25 @@ function liveRefreshJd(db) {
  * contradictory. And batch-prompt.md is in update-system.mjs SYSTEM_PATHS, so any
  * edit there is reverted by `node update-system.mjs apply`; a new file is not.
  *
- * Falls back to the full A-G batch prompt when the lean file is absent, so an
- * install that never adopted it keeps working unchanged.
+ * The fallback to the full A-G batch prompt is deliberately OPT-IN, not automatic.
+ * A silent fallback is the worst possible failure here: nothing errors, every row
+ * still scores, and the only symptom is that each job quietly costs ~2.3x more and
+ * fires ~8 web calls again. That is precisely the kind of regression an updater
+ * reverting this file would cause, so it has to be loud. Set
+ * CAREER_OPS_LEGACY_PROMPT=1 to run the old A-G prompt on purpose.
  */
 export function scorePromptPath() {
   const override = process.env.CAREER_OPS_SCORE_PROMPT;
   if (override) return override;
+  const legacy = join(HERE, 'batch', 'batch-prompt.md');
+  if (process.env.CAREER_OPS_LEGACY_PROMPT === '1') return legacy;
   const lean = join(HERE, 'batch', 'score-prompt.md');
-  return existsSync(lean) ? lean : join(HERE, 'batch', 'batch-prompt.md');
+  if (existsSync(lean)) return lean;
+  throw new Error(
+    'batch/score-prompt.md is missing. The lean scorer prompt is gone — an update may have removed it.\n'
+    + '  Restore it, or set CAREER_OPS_LEGACY_PROMPT=1 to deliberately run the full A-G prompt\n'
+    + '  (which costs roughly 2.3x more per job and makes ~8 web calls).',
+  );
 }
 
 /** Production dependency bag for processRow: real reserve/release/fs/spawn. */
