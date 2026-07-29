@@ -713,7 +713,13 @@ export function parseReportHeader(markdown, filename = '') {
   if (!url || !rawScore || !reportNum) return null;
   const score = Number(rawScore);
   if (!Number.isFinite(score)) return null;
-  return { url, score, reportNum };
+  // The scale travels with the number. Recovering a score without its model
+  // would hand back a lean score wearing no label, and every reader defaults an
+  // unlabelled score to legacy -- the same pooling, reintroduced by the repair
+  // path. Read out of the Machine Summary because the header does not carry it;
+  // absent means the report predates the key, which is what null says.
+  const scoreModel = md.match(/^score_model:\s*["']?([\w.-]+)["']?/m)?.[1] ?? null;
+  return { url, score, reportNum, scoreModel };
 }
 
 /**
@@ -730,14 +736,14 @@ export function parseReportHeader(markdown, filename = '') {
  */
 export function healFromReports(db, reports = [], { now = Date.now() } = {}) {
   const stmt = db.prepare(`
-    UPDATE jobs SET score = ?, report_num = ?, scored_at = ?, queue_status = 'evaluated'
+    UPDATE jobs SET score = ?, report_num = ?, scored_at = ?, score_model = ?, queue_status = 'evaluated'
     WHERE (canonical_url = ? OR raw_url = ?) AND score IS NULL AND queue_status = 'llm_ready'
   `);
   const healed = [];
   for (const r of Array.isArray(reports) ? reports : []) {
     if (!r?.url || !Number.isFinite(r.score)) continue;
     const canon = canonicalizeUrl(r.url);
-    if (stmt.run(r.score, r.reportNum ?? null, now, canon, r.url).changes === 1) healed.push(r);
+    if (stmt.run(r.score, r.reportNum ?? null, now, r.scoreModel ?? null, canon, r.url).changes === 1) healed.push(r);
   }
   return healed;
 }

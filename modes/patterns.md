@@ -177,7 +177,18 @@ List of most common missing skills in negative/self-filtered outcomes with frequ
 
 ## Recommended Score Threshold
 
-State the data-driven minimum score and reasoning.
+State the data-driven minimum score and reasoning — but only when the data
+supports one. `scoreThreshold` carries two guards, and both mean "do not print a
+bar":
+
+- `hasEvidence: false` — no positive outcome exists yet. `recommended` is a
+  rendering default, not a finding. Say there is not enough outcome data.
+- `recommended: null` — the positive outcomes span more than one scoring scale
+  (`scoreModel`), so no single bar is valid. Report the per-scale minimums from
+  `byModel` instead, and say a bar for a scale has to come from outcomes scored
+  on that scale.
+
+Never print `null/5`, and never write a threshold to config in either case.
 
 ## Targeting Signal (interview sessions)
 
@@ -225,7 +236,10 @@ Ask the user if they want to act on any recommendations:
 If the user agrees:
 - For portal filter changes: edit `portals.yml`
 - For profile/archetype changes: edit `modes/_profile.md` (NEVER `_shared.md`)
-- For score threshold: add to `config/profile.yml` under a `patterns` key
+- For score threshold: add to `config/profile.yml` under a `patterns` key —
+  only when `scoreThreshold.hasEvidence` is true AND `recommended` is not null.
+  Otherwise there is no bar to write, and writing one invents a rule the data
+  does not support.
 
 ## Outcome Classification
 

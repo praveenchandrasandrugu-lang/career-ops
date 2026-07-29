@@ -954,6 +954,35 @@ eq('closedReportNums: header and separator rows are not mistaken for entries',
   eq('parseReportHeader: reads the score', h?.score, 3.7);
   eq('parseReportHeader: reads the URL', h?.url, 'https://greatamerica.wd12.myworkdayjobs.com/careers/job/Analyst_JR1161');
   eq('parseReportHeader: takes the report number from the filename', h?.reportNum, '322');
+  eq('parseReportHeader: a report predating score_model recovers as null, not a guess', h?.scoreModel, null);
+}
+// Recovery has to carry the SCALE back too, not just the number. A recovered row
+// whose score_model was dropped is a lean score wearing no label, which every
+// downstream reader then treats as legacy -- the same pooling, reintroduced by
+// the repair path.
+{
+  const md = [
+    '# Evaluation: Uhaul - Analyst',
+    '',
+    '**Score:** 2.6/5',
+    '**URL:** https://uhaul.example/jobs/1',
+    '',
+    '## Machine Summary',
+    '',
+    '```yaml',
+    'score: 2.6',
+    'score_model: "lean-v2"',
+    '```',
+  ].join('\n');
+  const h = parseReportHeader(md, '486-uhaul-2026-07-29.md');
+  eq('parseReportHeader: recovers the scale the score was produced on', h?.scoreModel, 'lean-v2');
+
+  const db = await claimedDb([{ url: 'https://uhaul.example/jobs/1', company: 'Uhaul', title: 'Analyst' }]);
+  healFromReports(db, [h]);
+  const st = db.prepare('SELECT score, score_model FROM jobs WHERE canonical_url = ?')
+    .get(canonicalizeUrl('https://uhaul.example/jobs/1'));
+  eq('healFromReports: restores the score', st?.score, 2.6);
+  eq('healFromReports: restores the scale alongside it', st?.score_model, 'lean-v2');
 }
 // A reserved-but-unwritten sentinel carries no URL and must never be mistaken
 // for a finished evaluation.

@@ -58,6 +58,11 @@ const MACHINE_SUMMARY_FIELDS = new Set([
 // scorer that replaced it emits `score_model: lean-v2` and grades CV fit alone.
 const LEGACY_SCORE_MODEL = 'legacy-v1';
 
+// A row whose report is missing or unreadable. Deliberately NOT legacy-v1: the
+// absence of a key inside a readable report is evidence, the absence of the
+// report is not.
+const UNKNOWN_SCORE_MODEL = 'unknown';
+
 // Used only when there is no positive-outcome evidence at all to derive a bar from.
 const DEFAULT_SCORE_THRESHOLD = 3.5;
 
@@ -239,7 +244,11 @@ function recommendScoreThreshold(positives) {
 
   if (models.length === 0) {
     return {
+      // A default to render, NOT a finding. `hasEvidence: false` is what callers
+      // must branch on: printing "set your bar at 3.5" as though an outcome
+      // backed it is worse than printing nothing.
       recommended: DEFAULT_SCORE_THRESHOLD,
+      hasEvidence: false,
       scoreModel: null,
       reasoning: 'Not enough positive outcome data to determine threshold.',
       positiveRange: 'N/A',
@@ -252,6 +261,7 @@ function recommendScoreThreshold(positives) {
     const only = summarized[model];
     return {
       recommended: only.recommended,
+      hasEvidence: true,
       scoreModel: model,
       reasoning: `Lowest score among positive outcomes is ${Math.min(...byModel[model])}. `
         + `No applications below this score led to progress. Scale: ${model}.`,
@@ -262,6 +272,7 @@ function recommendScoreThreshold(positives) {
 
   return {
     recommended: null,
+    hasEvidence: true,
     scoreModel: null,
     reasoning: `Positive outcomes span ${models.length} score models (${models.join(', ')}), which are different `
       + 'scales and cannot be pooled into one threshold. Per-scale minimums are in byModel. '
@@ -335,6 +346,22 @@ company_confidential: true
 
     const none = recommendScoreThreshold([]);
     if (none.recommended !== 3.5) failures.push('empty evidence no longer falls back to 3.5');
+    // ...but that fallback is a default, not a finding. With no evidence at all
+    // there is no scale, and a caller must be able to tell the two apart before
+    // it prints "set your bar at 3.5" as though something backed it.
+    if (none.scoreModel !== null) failures.push('empty evidence claimed a scale');
+    if (none.hasEvidence !== false) failures.push('empty evidence did not mark itself evidence-free');
+    if (oneModel.hasEvidence !== true) failures.push('real evidence was not marked as evidence');
+
+    // A row whose report cannot be read is NOT the same as a report that simply
+    // predates the score_model key. The first is unknown, the second is legacy.
+    // Collapsing them re-opens the pooling: a lean-scored row with a broken
+    // report link would be counted as legacy evidence.
+    const unknown = recommendScoreThreshold([
+      { score: 4.2, scoreModel: 'legacy-v1' },
+      { score: 3.1, scoreModel: 'unknown' },
+    ]);
+    if (unknown.recommended !== null) failures.push('an unreadable-report score was pooled into the legacy bucket');
   }
   if (summary?.company_confidential !== true) failures.push('company_confidential boolean was not preserved from Machine Summary');
 
@@ -667,10 +694,17 @@ function analyze() {
       normalizedStatus: normalizeStatus(e.status),
       outcome,
       score,
-      // Which scale `score` is on. The tracker column carries no model, so this
-      // comes off the linked report; a row with no readable report is legacy by
-      // the same argument the reports use.
-      scoreModel: reportData?.scoreModel || LEGACY_SCORE_MODEL,
+      // Which scale `score` is on. The tracker column carries no model, so it has
+      // to come off the linked report.
+      //
+      // Two different absences live here and they are NOT the same. A readable
+      // report with no score_model key predates the key, so it is legacy-v1 --
+      // parseReport already resolves that. But a row whose report is missing or
+      // unreadable tells us nothing at all, and calling that legacy would quietly
+      // count a lean-scored row as legacy evidence, which is the exact pooling
+      // this is meant to stop. Unknown is its own bucket, so it forces the
+      // threshold to abstain rather than guess.
+      scoreModel: reportData ? (reportData.scoreModel || LEGACY_SCORE_MODEL) : UNKNOWN_SCORE_MODEL,
       report: reportData,
       remoteBucket: classifyRemote(remoteSource),
       companySize: classifyCompanySize(teamSource),
@@ -712,11 +746,23 @@ function analyze() {
     };
   };
 
+  // The per-outcome averages are kept in their existing shape because the
+  // dashboards read them, but they average across scoring scales and that is
+  // about to matter: the positives are all legacy-scored while new pending rows
+  // are lean. So the scale mix travels WITH the numbers instead of being implied
+  // by them, and `mixedScales` says outright when the comparison is apples to
+  // oranges.
+  const modelsPerOutcome = {};
+  for (const e of enriched) {
+    if (e.score > 0) (modelsPerOutcome[e.outcome] ||= new Set()).add(e.scoreModel);
+  }
   const scoreComparison = {
     positive: scoreStats(scoresByOutcome.positive),
     negative: scoreStats(scoresByOutcome.negative),
     self_filtered: scoreStats(scoresByOutcome.self_filtered),
     pending: scoreStats(scoresByOutcome.pending),
+    scoreModels: Object.fromEntries(Object.entries(modelsPerOutcome).map(([k, v]) => [k, [...v].sort()])),
+    mixedScales: new Set(Object.values(modelsPerOutcome).flatMap((s) => [...s])).size > 1,
   };
 
   // --- Archetype breakdown ---
@@ -954,14 +1000,14 @@ function analyze() {
   // Score threshold recommendation. Skipped entirely when the evidence spans
   // more than one scoring scale (recommended === null): recommending a bar we
   // cannot justify is worse than recommending none.
-  if (scoreThreshold.recommended !== null && scoreThreshold.recommended > 3.0) {
+  if (scoreThreshold.hasEvidence && scoreThreshold.recommended !== null && scoreThreshold.recommended > 3.0) {
     recommendations.push({
       action: `Set minimum score threshold at ${scoreThreshold.recommended}/5 before generating PDFs`,
       reasoning: `No positive outcomes below ${scoreThreshold.recommended}/5 on the ${scoreThreshold.scoreModel} scale. `
         + 'Scores below this are wasted effort.',
       impact: 'medium',
     });
-  } else if (scoreThreshold.recommended === null) {
+  } else if (scoreThreshold.hasEvidence && scoreThreshold.recommended === null) {
     recommendations.push({
       action: 'Score some applications on the current scale before trusting a minimum-score bar',
       reasoning: scoreThreshold.reasoning,
@@ -1157,7 +1203,12 @@ function printSummary(result) {
   }
 
   // Score threshold
-  console.log(`\nSCORE THRESHOLD: ${scoreThreshold.recommended === null ? 'no single bar (mixed scales)' : `${scoreThreshold.recommended}/5`}`);
+  const bar = !scoreThreshold.hasEvidence
+    ? `${scoreThreshold.recommended}/5 (default — no positive outcome backs this)`
+    : scoreThreshold.recommended === null
+      ? 'no single bar (mixed scales)'
+      : `${scoreThreshold.recommended}/5`;
+  console.log(`\nSCORE THRESHOLD: ${bar}`);
   console.log(`  ${scoreThreshold.reasoning}`);
   for (const [model, s] of Object.entries(scoreThreshold.byModel || {})) {
     console.log(`  ${model}: lowest positive ${s.recommended}/5, range ${s.range} (n=${s.count})`);
