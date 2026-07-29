@@ -133,6 +133,9 @@ portals-harsh.yml
 
 # Tool caches (binary, machine-local)
 .tokensave/
+.playwright-browsers/
+.chrome-profile*/
+.chrome-cache*/
 
 # Batch working manifests (per-run job lists, not system code)
 batch/*-manifest.json

@@ -256,6 +256,23 @@ function recommendScoreThreshold(positives) {
     };
   }
 
+  // `unknown` is not a scale, it is the absence of one, so a bar can never be
+  // derived from it -- not even when it is the only thing present. Grouping by
+  // "any truthy model" previously let an all-unknown set fall through the
+  // single-model branch and come back with a real number whose stated scale was
+  // "unknown", which is a sentence that cannot mean anything.
+  if (models.length === 1 && models[0] === UNKNOWN_SCORE_MODEL) {
+    return {
+      recommended: null,
+      hasEvidence: true,
+      scoreModel: null,
+      reasoning: 'Every positive outcome links to a report that could not be read, so the scale behind '
+        + 'those scores is unknown and no threshold can be derived from them.',
+      positiveRange: 'N/A (unknown scale)',
+      byModel: summarized,
+    };
+  }
+
   if (models.length === 1) {
     const model = models[0];
     const only = summarized[model];
@@ -362,6 +379,17 @@ company_confidential: true
       { score: 3.1, scoreModel: 'unknown' },
     ]);
     if (unknown.recommended !== null) failures.push('an unreadable-report score was pooled into the legacy bucket');
+
+    // ...and `unknown` on its own is not a scale either. Grouping by any truthy
+    // model made an all-unknown set look like a single coherent scale, so it
+    // came back with a real number and "on the unknown scale" as its reasoning.
+    // Unknown means we do not know what these numbers mean; one bucket of them
+    // is no more interpretable than two.
+    const allUnknown = recommendScoreThreshold([
+      { score: 4.2, scoreModel: 'unknown' },
+      { score: 3.1, scoreModel: 'unknown' },
+    ]);
+    if (allUnknown.recommended !== null) failures.push('an all-unknown population produced a real threshold');
   }
   if (summary?.company_confidential !== true) failures.push('company_confidential boolean was not preserved from Machine Summary');
 
@@ -443,7 +471,17 @@ function parseTracker() {
 // --- Parse a single report file ---
 function parseReport(reportPath) {
   if (!existsSync(reportPath)) return null;
-  const content = readFileSync(reportPath, 'utf-8');
+  // A report that exists but cannot be read (permissions, a lock, a truncated
+  // write) must degrade to the same `unknown` a missing one produces. Letting
+  // the read throw aborts the ENTIRE analysis over one bad file, which is both
+  // a worse outcome and the opposite of the caller's contract: null means "no
+  // readable report", and that is exactly what this is.
+  let content;
+  try {
+    content = readFileSync(reportPath, 'utf-8');
+  } catch {
+    return null;
+  }
   const report = {
     company: null,
     role: null,
