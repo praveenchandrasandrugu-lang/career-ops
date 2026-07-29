@@ -344,6 +344,7 @@ export async function processRow(db, row, deps) {
   const {
     template, date, now = Date.now(), jdDir = 'jds', maxRetries = 3,
     reserveNum, releaseNum, writeJd, runWorker, discardTracker = () => {},
+    discardReport = () => {},
     refreshJd = null,
   } = deps;
   const token = row.claim_token;
@@ -358,6 +359,14 @@ export async function processRow(db, row, deps) {
       // fail/time out. merge-tracker runs unconditionally, so that orphan line
       // would post a tracker row for a run the queue is retrying. Discard it.
       try { discardTracker(reportNum); } catch { /* nothing was written */ }
+      // Same story one artefact earlier. The report is written BEFORE the
+      // worker's trailing checks (the verify-cv-facts gate), so a gate failure
+      // exits non-zero over a complete report. healFromReports runs at the start
+      // of the next pass and needs only **URL:** and **Score:** to promote that
+      // orphan to an authoritative `evaluated` score — silently converting this
+      // failure into a success, with no tracker row behind it and no retry ever
+      // paid for. A half-written body under an intact header reads identically.
+      try { discardReport(reportNum); } catch { /* nothing was written */ }
       try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
     }
     return { url, status: 'failed', score: null, reportNum, error: String(error) };
@@ -429,6 +438,10 @@ export async function processRow(db, row, deps) {
     try { releaseNum(reportNum); } catch { /* sentinel GC is a backstop */ }
     if (!owned) {
       try { discardTracker(reportNum); } catch { /* nothing was written */ }
+      // The winning worker writes its own report under its own number, so this
+      // one is an orphan nothing will ever reconcile — and an orphan carrying a
+      // valid header is exactly what healFromReports promotes.
+      try { discardReport(reportNum); } catch { /* nothing was written */ }
       return { url, status: 'lost', score, reportNum, error: 'claim lost (row reclaimed mid-run)' };
     }
     return { url, status: 'evaluated', score, reportNum, error: null };
@@ -921,6 +934,20 @@ function liveDeps({ date, now, fullAccess = false, db = null, refresh = true }) 
     discardTracker: (n) => {
       const tsv = join(HERE, 'batch', 'tracker-additions', `${n}.tsv`);
       try { if (existsSync(tsv)) unlinkSync(tsv); } catch { /* already gone */ }
+    },
+    // Remove the report an unsuccessful worker left on disk, before the NEXT
+    // run's healFromReports reads its header and promotes it to a real score.
+    // Matched by number prefix, not by full name: the worker derives the slug
+    // itself, so `${n}-{whatever}-{date}.md` is the only thing we can rely on.
+    // The RESERVED sentinel is left alone — releaseNum owns that one.
+    discardReport: (n) => {
+      const dir = join(HERE, 'reports');
+      if (!existsSync(dir)) return;
+      const prefix = `${n}-`;
+      for (const name of readdirSync(dir)) {
+        if (!name.startsWith(prefix) || !name.endsWith('.md') || name.includes('RESERVED')) continue;
+        try { unlinkSync(join(dir, name)); } catch { /* already gone */ }
+      }
     },
     runWorker: (prompt, o) => codexRunWorker(prompt, { ...o, fullAccess }),
   };

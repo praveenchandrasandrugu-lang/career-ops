@@ -292,7 +292,7 @@ async function rowFixture(stdout, { code = 0, reserveNum = () => '042' } = {}) {
   const url = canonicalizeUrl('https://co/jobs/9');
   db.prepare('UPDATE jobs SET jd_text = ?, jd_status = ? WHERE canonical_url = ?').run('We need an analyst.', 'ok', url);
   const [row] = claimUrls(db, [url], { now: 2_000, workerId: 'w1' });
-  const calls = { jd: [], prompts: [], released: [], discarded: [] };
+  const calls = { jd: [], prompts: [], released: [], discarded: [], discardedReports: [] };
   const deps = {
     template: 'JD={{JD_FILE}} URL={{URL}} N={{REPORT_NUM}} DATE={{DATE}} ID={{ID}}',
     date: '2026-07-23',
@@ -302,6 +302,7 @@ async function rowFixture(stdout, { code = 0, reserveNum = () => '042' } = {}) {
     releaseNum: (n) => calls.released.push(n),
     writeJd: (p, t) => calls.jd.push({ path: p, text: t }),
     discardTracker: (n) => calls.discarded.push(n),
+    discardReport: (n) => calls.discardedReports.push(n),
     runWorker: async (prompt) => { calls.prompts.push(prompt); return { stdout, code }; },
   };
   return { db, url, row, calls, deps };
@@ -394,6 +395,47 @@ const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num,
   T('processRow: still releases the reserved number on failure', calls.released.includes('042'));
   T('processRow: discards the tracker line a failed worker may have written (never merged)',
     calls.discarded.includes('042'));
+}
+
+// ── the orphaned REPORT a failed run leaves behind ──────────────────────────
+// The tracker line is not the only artefact a doomed worker writes. It writes
+// reports/{num}-{slug}-{date}.md first and runs its trailing checks (the
+// verify-cv-facts gate) after, so a gate failure exits non-zero with a complete
+// report already on disk. `failed` then returns the row to llm_ready.
+//
+// That is where it bites: readReportHeaders/healFromReports run at the START of
+// the next pass, and parseReportHeader only needs **URL:** and **Score:** to be
+// present. The orphan therefore converts a FAILED run into an authoritative
+// `evaluated` score before the retry can happen — and because the TSV was
+// discarded, the row lands in the queue with no tracker entry behind it. A
+// half-written body under an intact header scores just the same.
+//
+// The report has to be discarded exactly the way the tracker line already is.
+{
+  const failed = JSON.stringify({
+    status: 'failed', id: '042', report_num: '042', score: null,
+    error: 'verify-cv-facts: unsupported metric',
+  });
+  const { db, row, calls, deps } = await rowFixture(failed);
+  await processRow(db, row, deps);
+  T('processRow: discards the orphaned report of a failed run (else healFromReports resurrects it)',
+    calls.discardedReports.includes('042'));
+}
+{
+  // A worker that finished after losing its claim is the same shape: its report
+  // is an orphan the winning worker knows nothing about.
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  reclaimStale(db, { staleAfterMs: 0, now: 3_000 });
+  await processRow(db, row, deps);
+  T('processRow: discards the orphaned report of a lost claim', calls.discardedReports.includes('042'));
+}
+{
+  // Symmetry, and the line this fix must not cross: a SUCCESSFUL run's report is
+  // the durable artefact crash recovery reads. Deleting it would break the very
+  // mechanism healFromReports exists for.
+  const { db, row, calls, deps } = await rowFixture(COMPLETED);
+  await processRow(db, row, deps);
+  eq('processRow: KEEPS the report of a successful run (crash recovery reads it)', calls.discardedReports.length, 0);
 }
 
 // a worker that finishes AFTER its row was reclaimed must not report success or
