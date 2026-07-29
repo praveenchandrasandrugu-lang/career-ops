@@ -21,7 +21,7 @@
 import { pass, fail } from './helpers.mjs';
 import { openQueue, upsertJobs, claimUrls, canonicalizeUrl } from '../queue.mjs';
 import {
-  bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns,
+  bandFor, fillPrompt, parseFinalJson, renderApplyQueue, addScoreColumns, reportFilesFor,
   setScore, scoredKeepers, slugify, runPool, processRow, exitCodeFrom, buildCodexSpawn,
   killTree, staleWindowMs, dedupePool, titlePriority, orderForSpend, closedReportNums, isThinMarketState,
   parseReportHeader, healFromReports,
@@ -187,6 +187,29 @@ T('parseFinalJson: an object with no status is not accepted as the payload',
   // two are indistinguishable once written, and every downstream consumer pools
   // them silently.
   T('addScoreColumns: adds score_model, so the two scales stay distinguishable', cols.has('score_model'));
+  const dir = [
+    '042-clay-inc-2026-07-23.md',
+    '042-RESERVED.md',
+    '0420-other-co-2026-07-23.md',
+    '42-old-scheme-2026-07-01.md',
+    '142-elsewhere-2026-07-23.md',
+    '043-next-2026-07-23.md',
+    'notes.txt',
+  ];
+  // ── which files a report number owns ──────────────────────────────────────
+  // The deletion path picks its targets by number prefix, because the worker
+  // derives the slug itself and the orchestrator never learns it. Prefix
+  // matching is where an off-by-one deletes someone else's finished evaluation,
+  // so the rules are pinned here rather than left to a glob nobody reads.
+  const hit = reportFilesFor(dir, '042');
+  T('reportFilesFor: claims its own report', hit.includes('042-clay-inc-2026-07-23.md'));
+  T('reportFilesFor: leaves the RESERVED sentinel alone (releaseNum owns that)', !hit.includes('042-RESERVED.md'));
+  T('reportFilesFor: 042 does not swallow 0420 (the hyphen is load-bearing)', !hit.includes('0420-other-co-2026-07-23.md'));
+  T('reportFilesFor: 042 does not match the unpadded 42', !hit.includes('42-old-scheme-2026-07-01.md'));
+  T('reportFilesFor: does not match a number that merely ENDS in 042', !hit.includes('142-elsewhere-2026-07-23.md'));
+  T('reportFilesFor: leaves neighbouring numbers alone', !hit.includes('043-next-2026-07-23.md'));
+  T('reportFilesFor: ignores non-markdown', !hit.some((n) => n.endsWith('.txt')));
+  eq('reportFilesFor: claims exactly one file here', hit.length, 1);
   T('addScoreColumns: does NOT add a stored verdict column (derived from score)',
     !cols.has('verdict'));
   // Idempotent: a second call must not throw (duplicate-column error).
@@ -456,6 +479,27 @@ const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num,
   reclaimStale(db, { staleAfterMs: 0, now: 3_000 });
   await processRow(db, row, deps);
   T('processRow: discards the orphaned report of a lost claim', calls.discardedReports.includes('042'));
+}
+{
+  // ...but "lost" is not one state, it is two, and the second one is a trap.
+  // setScore and completeClaim are SEPARATE fenced writes. A reclaim landing
+  // between them lets the score write win its fence and the completion lose it,
+  // so the row ends up carrying THIS run's score and report_num while
+  // completeClaim reports false. Deleting the report then throws away a file the
+  // database still points at.
+  //
+  // The trigger stands in for that interleaving: the score write itself flips the
+  // claim token, which is exactly the window another scorer's reclaimStale opens.
+  const { db, url, row, calls, deps } = await rowFixture(COMPLETED);
+  db.exec(`
+    CREATE TRIGGER steal_claim AFTER UPDATE OF score ON jobs
+    BEGIN UPDATE jobs SET claim_token = 'another-worker' WHERE canonical_url = NEW.canonical_url; END;
+  `);
+  const res = await processRow(db, row, deps);
+  eq('processRow: a claim stolen after the score landed still reports lost', res.status, 'lost');
+  const st = db.prepare('SELECT score, report_num FROM jobs WHERE canonical_url = ?').get(url);
+  T('processRow: never deletes a report the row still points at',
+    !(st?.report_num && calls.discardedReports.includes(st.report_num)));
 }
 {
   // Symmetry, and the line this fix must not cross: a SUCCESSFUL run's report is

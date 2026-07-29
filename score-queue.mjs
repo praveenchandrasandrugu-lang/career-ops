@@ -448,9 +448,20 @@ export async function processRow(db, row, deps) {
     if (!owned) {
       try { discardTracker(reportNum); } catch { /* nothing was written */ }
       // The winning worker writes its own report under its own number, so this
-      // one is an orphan nothing will ever reconcile — and an orphan carrying a
-      // valid header is exactly what healFromReports promotes.
-      try { discardReport(reportNum); } catch { /* nothing was written */ }
+      // one is usually an orphan nothing will ever reconcile — and an orphan
+      // carrying a valid header is exactly what healFromReports promotes.
+      //
+      // "Usually", because a lost claim is really two states. setScore and
+      // completeClaim are separate fenced writes, so a reclaim landing BETWEEN
+      // them lets the score write win its fence while the completion loses it.
+      // The row then carries this run's own score and report_num, and the report
+      // on disk is the file it points at. Deleting a referenced report is worse
+      // than leaving an orphan: the score survives with nothing to justify it.
+      // So the row is asked, rather than assumed.
+      const recorded = db.prepare('SELECT report_num FROM jobs WHERE canonical_url = ?').get(url)?.report_num;
+      if (recorded !== reportNum) {
+        try { discardReport(reportNum); } catch { /* nothing was written */ }
+      }
       return { url, status: 'lost', score, reportNum, error: 'claim lost (row reclaimed mid-run)' };
     }
     return { url, status: 'evaluated', score, reportNum, error: null };
@@ -731,6 +742,32 @@ export function healFromReports(db, reports = [], { now = Date.now() } = {}) {
   return healed;
 }
 
+/**
+ * The report files a given report number owns, out of a directory listing.
+ *
+ * The orchestrator reserves the NUMBER but the worker derives the slug, so the
+ * full filename is never known upstream and the only usable handle is the
+ * prefix. Pulled out of the deletion path and given its own tests because a
+ * sloppy prefix match here deletes someone else's finished evaluation.
+ *
+ * The trailing hyphen is load-bearing: without it `042` also claims `0420-...`.
+ * Zero-padding is not normalized either, so `042` and `42` are different numbers
+ * rather than the same one spelled two ways — reserve-report-num.mjs pads on the
+ * way out, and inventing an equivalence here would widen the match.
+ *
+ * RESERVED sentinels are excluded: releaseNum owns those.
+ *
+ * @param {string[]} names  a directory listing (basenames)
+ * @param {string} reportNum
+ * @returns {string[]} the basenames belonging to that number
+ */
+export function reportFilesFor(names, reportNum) {
+  const prefix = `${reportNum}-`;
+  return (Array.isArray(names) ? names : []).filter(
+    (n) => n.startsWith(prefix) && n.endsWith('.md') && !n.includes('RESERVED'),
+  );
+}
+
 // ── the column migration ────────────────────────────────────────────────────
 
 /**
@@ -959,9 +996,7 @@ function liveDeps({ date, now, fullAccess = false, db = null, refresh = true }) 
     discardReport: (n) => {
       const dir = join(HERE, 'reports');
       if (!existsSync(dir)) return;
-      const prefix = `${n}-`;
-      for (const name of readdirSync(dir)) {
-        if (!name.startsWith(prefix) || !name.endsWith('.md') || name.includes('RESERVED')) continue;
+      for (const name of reportFilesFor(readdirSync(dir), n)) {
         try { unlinkSync(join(dir, name)); } catch { /* already gone */ }
       }
     },
