@@ -275,12 +275,20 @@ Success:
   "company": "{company}",
   "role": "{role}",
   "score": {score_num},
+  "score_model": "lean-v2",
   "legitimacy": "{High Confidence|Proceed with Caution|Suspicious}",
   "pdf": {pdf_path_json_string_or_null},
   "report": "{report_path}",
   "error": null
 }
 ```
+
+`score_model` is the literal string `lean-v2`, never omitted and never altered. It
+records which scale produced `score`, and the orchestrator stores it on the row.
+A score from this prompt is CV fit plus hard stops; the scorer before it also
+folded in legitimacy, comp transparency and role realism. Drop the key and the two
+become indistinguishable once written, and every threshold and average downstream
+silently pools them.
 
 Hard reject from Step 1. No report, no PDF, no tracker line:
 

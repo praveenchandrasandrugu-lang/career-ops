@@ -181,6 +181,12 @@ T('parseFinalJson: an object with no status is not accepted as the payload',
   T('addScoreColumns: adds legitimacy', cols.has('legitimacy'));
   T('addScoreColumns: adds report_num', cols.has('report_num'));
   T('addScoreColumns: adds scored_at', cols.has('scored_at'));
+  // A score is only comparable to another score from the same scorer. lean-v2
+  // grades CV fit plus hard stops; the scorer before it folded legitimacy, comp
+  // transparency and role realism into the same number. Without this column the
+  // two are indistinguishable once written, and every downstream consumer pools
+  // them silently.
+  T('addScoreColumns: adds score_model, so the two scales stay distinguishable', cols.has('score_model'));
   T('addScoreColumns: does NOT add a stored verdict column (derived from score)',
     !cols.has('verdict'));
   // Idempotent: a second call must not throw (duplicate-column error).
@@ -379,6 +385,28 @@ const stateOf = (db, url) => db.prepare('SELECT queue_status, score, report_num,
     calls.prompts[0].includes('https://co/jobs/9') && calls.prompts[0].includes('jds/042-clay-inc.txt'));
   T('processRow: released the report-number sentinel after the run', calls.released.includes('042'));
   T('processRow: KEEPS the tracker line for a successful run (it gets merged)', calls.discarded.length === 0);
+}
+
+// ── which scale the score is on ─────────────────────────────────────────────
+// The worker declares it in the Machine Summary as score_model. Recording it on
+// the row is what keeps a lean score from being averaged against, or thresholded
+// with, a legacy one. A worker that emits none predates the key, so the column
+// stays NULL rather than guessing a value.
+{
+  const leanPayload = JSON.stringify({
+    status: 'completed', id: '042', report_num: '042', company: 'Clay', role: 'Data Analyst',
+    score: 4.5, score_model: 'lean-v2', legitimacy: 'High Confidence', pdf: null, report: null, error: null,
+  });
+  const { db, url, row, deps } = await rowFixture(leanPayload);
+  await processRow(db, row, deps);
+  eq('processRow: records the scale the score was produced on',
+    db.prepare('SELECT score_model FROM jobs WHERE canonical_url = ?').get(url)?.score_model, 'lean-v2');
+}
+{
+  const { db, url, row, deps } = await rowFixture(COMPLETED); // no score_model key
+  await processRow(db, row, deps);
+  eq('processRow: a worker that declares no scale leaves the column NULL, it does not invent one',
+    db.prepare('SELECT score_model FROM jobs WHERE canonical_url = ?').get(url)?.score_model, null);
 }
 
 // failure path: the worker emitted a failed payload

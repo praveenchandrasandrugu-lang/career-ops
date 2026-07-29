@@ -1256,6 +1256,32 @@ if (
   fail('batch Machine Summary and downstream parser fields are misaligned');
 }
 
+// ── score_model has to survive the WHOLE chain, not just be written down ────
+// It was declared in the lean prompt's Machine Summary and read by nothing: the
+// report parser dropped unknown keys, the final JSON never carried it, and the
+// queue had no column for it. Prose said there were two scales, the data model
+// said there was one. Each link is pinned here because breaking any one of them
+// silently restores the pooling.
+{
+  const leanPrompt = readFile('batch/score-prompt.md');
+  const leanFinalJson = leanPrompt.match(/## Step 6 — Final JSON[\s\S]*?(?=\n## )/)?.[0] ?? '';
+  const scoreQueue = readFile('score-queue.mjs');
+  const links = [
+    ['the lean prompt writes it into the Machine Summary', /^score_model:/m.test(leanPrompt)],
+    ['the lean prompt returns it in the final JSON', /"score_model"/.test(leanFinalJson)],
+    ['the queue has a column to store it', /score_model: 'TEXT'/.test(scoreQueue)],
+    ['setScore actually writes that column', /score_model = \?/.test(scoreQueue)],
+    ['processRow reads it off the worker payload', /payload\.score_model/.test(scoreQueue)],
+    ['the report parser keeps the key', /['"]score_model['"]/.test(patternsMachineFields)],
+  ];
+  const broken = links.filter(([, ok]) => !ok).map(([what]) => what);
+  if (broken.length === 0) {
+    pass('score_model survives every link from prompt to queue to analysis');
+  } else {
+    fail(`score_model chain is broken: ${broken.join('; ')}`);
+  }
+}
+
 // ── 8. MODE FILE INTEGRITY ──────────────────────────────────────
 
 console.log('\n8. Mode file integrity');

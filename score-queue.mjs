@@ -213,11 +213,11 @@ export function renderApplyQueue(rows = []) {
  * @param {{score:number, legitimacy?:string, reportNum?:string, token?:string|null, now?:number}} opts
  * @returns {boolean} true when this caller actually owned the row
  */
-export function setScore(db, canonicalUrl, { score, legitimacy = null, reportNum = null, token = null, now = Date.now() } = {}) {
+export function setScore(db, canonicalUrl, { score, legitimacy = null, reportNum = null, scoreModel = null, token = null, now = Date.now() } = {}) {
   return db.prepare(`
-    UPDATE jobs SET score = ?, legitimacy = ?, report_num = ?, scored_at = ?
+    UPDATE jobs SET score = ?, legitimacy = ?, report_num = ?, scored_at = ?, score_model = ?
     WHERE canonical_url = ? AND queue_status = 'in_progress' AND claim_token IS ?
-  `).run(score, legitimacy, reportNum, now, canonicalUrl, token).changes === 1;
+  `).run(score, legitimacy, reportNum, now, scoreModel, canonicalUrl, token).changes === 1;
 }
 
 // ── report numbers the candidate has already dealt with ────────────────────
@@ -429,7 +429,16 @@ export async function processRow(db, row, deps) {
     const score = Number(payload.score);
     if (!Number.isFinite(score)) return failed(`non-numeric score ${JSON.stringify(payload.score)}`);
 
-    setScore(db, url, { score, legitimacy: payload.legitimacy ?? null, reportNum, token, now });
+    setScore(db, url, {
+      score,
+      legitimacy: payload.legitimacy ?? null,
+      reportNum,
+      // Straight through from the worker: a missing key means a scorer that
+      // predates it, and NULL says exactly that. See addScoreColumns.
+      scoreModel: payload.score_model ?? null,
+      token,
+      now,
+    });
     // completeClaim is fenced on the claim token. If it returns false this
     // worker's row was reclaimed mid-run and now belongs to someone else — the
     // setScore above was refused too, so the DB is untouched. Do NOT report
@@ -739,6 +748,13 @@ export function addScoreColumns(db) {
     legitimacy: 'TEXT',
     report_num: 'TEXT',
     scored_at: 'INTEGER',
+    // Which scorer produced `score`. lean-v2 grades CV fit plus hard stops; the
+    // scorer before it folded legitimacy, comp transparency and role realism
+    // into the same number, so the two are different scales and a bar set on one
+    // means nothing on the other. NULL means the row predates the key, which is
+    // the only honest reading -- backfilling a guess would erase the distinction
+    // this column exists to preserve.
+    score_model: 'TEXT',
   };
   for (const [name, decl] of Object.entries(columns)) {
     if (!have.has(name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${decl}`);
