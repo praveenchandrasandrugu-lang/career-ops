@@ -354,6 +354,16 @@ const USER_PATHS = [
   'batch/score-prompt.md',
   'HANDOFF-semantic-scoring.md',
   'OFFTHELOOP-FLOW-SPEC.md',
+  // Locally authored design docs, living inside `docs/` which is a SYSTEM_PATH.
+  //
+  // They are NOT at risk from rollback: that loop only deletes a SYSTEM_PATHS
+  // *entry* missing from the backup, and `git checkout <ref> -- docs/` leaves
+  // untracked-in-ref files inside the directory alone (verified empirically, not
+  // assumed). Listed here for the other reason: the post-update safety check at
+  // the bottom of apply() flags anything matching a USER_PATHS prefix as a
+  // violation and reverts it, so an upstream change that ever reached into
+  // docs/specs/ would be caught instead of quietly overwriting his own specs.
+  'docs/specs/',
   'voice-dna.md',
   'portals.yml',
   'portals-harsh.yml',
