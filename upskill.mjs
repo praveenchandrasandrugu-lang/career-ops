@@ -45,6 +45,11 @@ export const SCHEMA_VERSION = 1;
 // gaps matter most. Matches the apply threshold in Ethical Use (CLAUDE.md).
 const LOW_FIT_SCORE = 4.0;
 
+// A report with no `score_model` was produced before the key existed, by the
+// scorer that folded legitimacy, comp transparency and role realism into the
+// score. Named here so the default is stated once rather than assumed.
+const LEGACY_SCORE_MODEL = 'legacy-v1';
+
 // Skill tokenizer. Superset of the tech regex in analyze-patterns.mjs
 // (deliberately duplicated — see #1520 discussion: extracting a shared module
 // from a tested core script is a follow-up once both call sites are stable).
@@ -180,12 +185,15 @@ function normalizeList(value) {
 export function parseReportGaps(content) {
   const gapDescriptions = [];
   let score = null;
+  let scoreModel = null;
   let hasMachineSummary = false;
 
   const summary = parseMachineSummary(content);
   if (summary) {
     hasMachineSummary = true;
     if (typeof summary.score === 'number' && Number.isFinite(summary.score)) score = summary.score;
+    // Which scale `score` is on. Absent means the report predates the key.
+    if (typeof summary.score_model === 'string' && summary.score_model) scoreModel = summary.score_model;
     gapDescriptions.push(...normalizeList(summary.hard_stops));
     gapDescriptions.push(...normalizeList(summary.soft_gaps));
   }
@@ -204,7 +212,7 @@ export function parseReportGaps(content) {
     }
   }
 
-  return { score, gapText: gapDescriptions.join('\n'), hasMachineSummary };
+  return { score, scoreModel, gapText: gapDescriptions.join('\n'), hasMachineSummary };
 }
 
 /**
@@ -217,6 +225,21 @@ export function aggregateGaps(reports, knownSkills) {
   const scored = reports.filter(r => Number.isFinite(r.score));
   const lowFit = scored.filter(r => r.score < LOW_FIT_SCORE);
   const totalLowFit = lowFit.length;
+
+  // Both knobs below are absolute cuts on a score scale: `LOW_FIT_SCORE` picks
+  // the population, and `5 - score` weights it. There are now two scales, and
+  // lean-v2 runs lower than the one before it because it grades CV fit alone.
+  // Pooled, every lean report earns a bigger weight than a legacy report of the
+  // same real fit, so lean-named gaps drift to the top of the list for a reason
+  // that has nothing to do with the candidate. No honest conversion exists
+  // between the scales, so this reports the mix instead of averaging it away and
+  // callers can scope to one scale. Absent means the report predates the key.
+  const scoreModels = {};
+  for (const r of scored) {
+    const m = r.scoreModel || LEGACY_SCORE_MODEL;
+    scoreModels[m] = (scoreModels[m] || 0) + 1;
+  }
+  const mixedScales = Object.keys(scoreModels).length > 1;
 
   const bySkill = new Map();
   const excludedCounts = new Map();
@@ -260,7 +283,7 @@ export function aggregateGaps(reports, knownSkills) {
     .map(([skill, reports]) => ({ skill, reports }))
     .sort((a, b) => b.reports - a.reports);
 
-  return { gaps, excludedAsKnown, totalLowFit };
+  return { gaps, excludedAsKnown, totalLowFit, scoreModels, mixedScales };
 }
 
 /**
@@ -315,12 +338,13 @@ function analyze(minReports) {
     if (!reportPath) continue;
     reportsRead += 1;
     const content = readFileSync(reportPath, 'utf-8');
-    const { score, gapText, hasMachineSummary } = parseReportGaps(content);
+    const { score, scoreModel, gapText, hasMachineSummary } = parseReportGaps(content);
     if (hasMachineSummary) reportsWithMachineSummary += 1;
     const trackerScore = parseFloat(row.score);
     parsedReports.push({
       num: row.num,
       score: Number.isFinite(trackerScore) ? trackerScore : score,
+      scoreModel,
       gapText,
     });
   }
@@ -340,7 +364,7 @@ function analyze(minReports) {
   ].join('\n');
   const knownSkills = extractSkills(knownText);
 
-  const { gaps, excludedAsKnown, totalLowFit } = aggregateGaps(parsedReports, knownSkills);
+  const { gaps, excludedAsKnown, totalLowFit, scoreModels, mixedScales } = aggregateGaps(parsedReports, knownSkills);
 
   return {
     schema_version: SCHEMA_VERSION,
@@ -352,6 +376,11 @@ function analyze(minReports) {
       lowFitReports: totalLowFit,
       lowFitScoreThreshold: LOW_FIT_SCORE,
       knownSkillCount: knownSkills.size,
+      // Both the low-fit cut and the (5 - score) weight are absolute cuts on a
+      // score scale, so a mixed population tilts the ranking toward whichever
+      // scale scores lower. Reported, not silently averaged away.
+      scoreModels,
+      mixedScales,
     },
     gaps,
     excludedAsKnown,
@@ -367,6 +396,11 @@ function printSummary(result) {
   const m = result.metadata;
   console.log(`UPSKILL GAP MAP (schema v${result.schema_version})`);
   console.log(`Reports: ${m.reportsRead}/${m.reportsLinked} read, ${m.reportsScored} scored, ${m.lowFitReports} low-fit (<${m.lowFitScoreThreshold}), ${m.reportsWithMachineSummary} with Machine Summary`);
+  if (m.mixedScales) {
+    const mix = Object.entries(m.scoreModels).map(([k, v]) => `${k} ${v}`).join(', ');
+    console.log(`⚠ Mixed score scales (${mix}). The low-fit cut and the weight are both`);
+    console.log('  absolute cuts on a score, so the lower-scoring scale is over-represented here.');
+  }
   console.log('');
   if (result.gaps.length === 0) {
     console.log('No skill gaps detected across your evaluated reports.');
@@ -470,6 +504,40 @@ function runSelfTest() {
   const spark = g4.find(g => g.skill === 'Spark');
   if (terraform?.tier !== 'Critical') failures.push(`Terraform tier expected Critical, got ${terraform?.tier}`);
   if (spark?.tier !== 'Low') failures.push(`Spark tier expected Low, got ${spark?.tier}`);
+
+  // ── the weighting is scale-relative, so mixing scales distorts it ──────────
+  // Weight is (5 - score) and "low fit" is a fixed score < 4.0. Both are absolute
+  // cuts on a scale, and there are now two scales: lean-v2 grades CV fit alone
+  // and runs LOWER than the scorer before it, which folded in legitimacy, comp
+  // transparency and role realism. Pool them and every lean report gets a bigger
+  // weight than a legacy report of the same real fit, so lean-named gaps quietly
+  // outrank everything. No honest conversion exists between the two, so the mix
+  // has to be reported rather than silently averaged.
+  {
+    const mixed = aggregateGaps([
+      { num: 20, score: 2.0, scoreModel: 'lean-v2', gapText: 'Terraform' },
+      { num: 21, score: 3.0, scoreModel: 'legacy-v1', gapText: 'Terraform' },
+    ], new Set());
+    if (mixed.mixedScales !== true) failures.push('aggregateGaps pooled two score models without flagging it');
+    if (mixed.scoreModels?.['lean-v2'] !== 1 || mixed.scoreModels?.['legacy-v1'] !== 1) {
+      failures.push('aggregateGaps does not report how many reports came from each scale');
+    }
+    const single = aggregateGaps([
+      { num: 22, score: 2.0, scoreModel: 'lean-v2', gapText: 'Terraform' },
+      { num: 23, score: 2.5, scoreModel: 'lean-v2', gapText: 'Terraform' },
+    ], new Set());
+    if (single.mixedScales !== false) failures.push('a single-scale population was reported as mixed');
+    // A report with no score_model predates the key, exactly as elsewhere.
+    const implied = aggregateGaps([{ num: 24, score: 2.0, gapText: 'Terraform' }], new Set());
+    if (implied.scoreModels?.['legacy-v1'] !== 1) failures.push('a report with no score_model was not counted as legacy');
+  }
+
+  // parseReportGaps must carry the scale out of the Machine Summary, or the
+  // aggregate above can never see it.
+  {
+    const leanReport = parseReportGaps('## Machine Summary\n\n```yaml\nscore: 2.6\nscore_model: "lean-v2"\n```\n');
+    if (leanReport.scoreModel !== 'lean-v2') failures.push('parseReportGaps did not read score_model');
+  }
 
   // parseReportGaps: Machine Summary + Gap table + score fallback
   const parsed = parseReportGaps(`
