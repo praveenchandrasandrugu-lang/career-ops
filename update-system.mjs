@@ -337,11 +337,23 @@ const BOOTSTRAP_PATHS = [
 ];
 
 // User layer paths — NEVER touch these (safety check)
+//
+// Locally-authored files belong HERE, not in SYSTEM_PATHS, even when they are
+// scripts or docs rather than personal data. SYSTEM_PATHS is the set the updater
+// syncs from upstream, and the rollback path above deletes any SYSTEM_PATH that
+// is absent from the backup tree — so listing a file upstream has never heard of
+// makes `rollback` silently remove it. Verified against upstream: none of
+// reset-pool.mjs, batch/score-prompt.md, or the two design docs exist there.
 const USER_PATHS = [
   'cv.md',
   'config/profile.yml',
   'modes/_profile.md',
   'modes/_custom.md',
+  // Locally authored, not upstream. See the note above.
+  'reset-pool.mjs',
+  'batch/score-prompt.md',
+  'HANDOFF-semantic-scoring.md',
+  'OFFTHELOOP-FLOW-SPEC.md',
   'voice-dna.md',
   'portals.yml',
   'portals-harsh.yml',

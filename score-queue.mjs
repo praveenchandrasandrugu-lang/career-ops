@@ -867,12 +867,35 @@ function liveRefreshJd(db) {
   };
 }
 
+/**
+ * Which prompt the scoring workers run.
+ *
+ * `batch/score-prompt.md` is the lean scorer: it emits Block B and the machine
+ * contracts only, makes no web calls, and does its hard-reject scan on the ad
+ * BEFORE loading cv.md/profile. It exists as its own file rather than as edits to
+ * `batch/batch-prompt.md` for two reasons. That prompt declares itself
+ * self-contained and orders the worker to "complete every block below", so a
+ * house-rule override in modes/_custom.md cannot reliably countermand it — and
+ * worse, the test suite would keep passing while the live worker stayed
+ * contradictory. And batch-prompt.md is in update-system.mjs SYSTEM_PATHS, so any
+ * edit there is reverted by `node update-system.mjs apply`; a new file is not.
+ *
+ * Falls back to the full A-G batch prompt when the lean file is absent, so an
+ * install that never adopted it keeps working unchanged.
+ */
+export function scorePromptPath() {
+  const override = process.env.CAREER_OPS_SCORE_PROMPT;
+  if (override) return override;
+  const lean = join(HERE, 'batch', 'score-prompt.md');
+  return existsSync(lean) ? lean : join(HERE, 'batch', 'batch-prompt.md');
+}
+
 /** Production dependency bag for processRow: real reserve/release/fs/spawn. */
 function liveDeps({ date, now, fullAccess = false, db = null, refresh = true }) {
   const reserveScript = join(HERE, 'reserve-report-num.mjs');
   return {
     refreshJd: refresh && db ? liveRefreshJd(db) : null,
-    template: readFileSync(join(HERE, 'batch', 'batch-prompt.md'), 'utf-8'),
+    template: readFileSync(scorePromptPath(), 'utf-8'),
     date, now, jdDir: 'jds',
     reserveNum: () => execFileSync(process.execPath, [reserveScript], { cwd: HERE }).toString().trim(),
     releaseNum: (n) => { try { execFileSync(process.execPath, [reserveScript, '--release', n], { cwd: HERE }); } catch { /* GC backstop */ } },
