@@ -106,6 +106,10 @@ data/model-blacklist.json
 # CLI-specific local config
 .claude/settings.local.json
 .claude/memory/
+# Project-local overrides of the global /start-session and /save-progress commands.
+# They hard-code this machine's auto-memory path (so they embed the OS username) and
+# describe one person's workflow, neither of which belongs in a public fork.
+.claude/commands/
 .opencode/settings.local.json
 .opencode/memory/
 career-dashboard
@@ -136,6 +140,11 @@ portals-harsh.yml
 .playwright-browsers/
 .chrome-profile*/
 .chrome-cache*/
+# Same class, different launchers: liveness checks leave these behind (an Edge or
+# Chromium user-data dir, sometimes suffixed with the report number it was checking).
+.edge-profile*/
+.tmp-chrome-profile*/
+.tmp-edge-profile*/
 
 # Batch working manifests (per-run job lists, not system code)
 batch/*-manifest.json

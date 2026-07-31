@@ -380,6 +380,14 @@ const USER_PATHS = [
   'plugins.lock',
   '.claude/settings.json',
   '.claude/hooks/',
+  // Locally-authored project overrides of the global /start-session and
+  // /save-progress commands. Upstream has no .claude/commands/ at all, and the only
+  // .claude entry in SYSTEM_PATHS is the skills dir, so these are safe from the
+  // rollback delete loop; listed here so the post-update safety check would catch any
+  // future upstream reach into this directory. Do not name other paths in quotes
+  // inside this block: updater-migration-tests.mjs parses it by extracting quoted
+  // strings, so a quoted path in a comment becomes a phantom USER_PATHS entry.
+  '.claude/commands/',
 ];
 
 function parseVersionFile(raw) {
