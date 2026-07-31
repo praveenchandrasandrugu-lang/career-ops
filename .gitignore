@@ -160,3 +160,5 @@ batch/*-manifest.json
 # phone, email) to build tailored PDFs, so they must never reach a public fork.
 tmp/
 .tmp/
+# Personal do-not-apply ledger: employer names, user layer, never published.
+data/blacklist.md
