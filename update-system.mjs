@@ -351,6 +351,7 @@ const USER_PATHS = [
   'modes/_custom.md',
   // Locally authored, not upstream. See the note above.
   'reset-pool.mjs',
+  'apply-sheet.mjs',
   'batch/score-prompt.md',
   'HANDOFF-semantic-scoring.md',
   'OFFTHELOOP-FLOW-SPEC.md',
