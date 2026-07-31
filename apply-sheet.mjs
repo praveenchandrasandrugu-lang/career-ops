@@ -15,7 +15,7 @@
  *
  * Usage:
  *   node apply-sheet.mjs                     # publish to the default vault
- *   node apply-sheet.mjs --min 3.5           # keepers only (default 3.0)
+ *   node apply-sheet.mjs --min 3.0           # include the marginal band (default 3.5: keepers only)
  *   node apply-sheet.mjs --liveness          # re-check every URL first (slow, worth it)
  *   node apply-sheet.mjs --vault D:/notes    # somewhere else
  *   node apply-sheet.mjs --dry-run           # print the plan, write nothing
@@ -132,15 +132,20 @@ function checkLiveness(urls) {
   return status;
 }
 
-function taskLine(row, cvFile, outputDir) {
-  const cv = cvFile
-    ? `[CV](file:///${join(outputDir, cvFile).replace(/\\/g, '/')})`
-    : '_no tailored CV_';
-  const company = row.company === '?' ? '**?** (employer not named)' : row.company;
-  return [
-    `- [ ] **${row.score}** · ${company} — ${row.title}`,
-    `    - [Apply](${row.canonical_url}) · ${cv} · report \`${Number(row.report_num)}\``,
-  ].join('\n');
+const TABLE_HEAD = [
+  '| Score | Company | Role | CV file (in `output/`) | Report | Apply |',
+  '|------:|---------|------|------------------------|-------:|-------|',
+].join('\n');
+
+function tableRow(row, cvFile) {
+  const cell = (v) => String(v ?? '').replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
+  const company = row.company === '?' ? '**?** _(not named)_' : cell(row.company);
+  const cv = cvFile ? `\`${cvFile}\`` : '**none yet**';
+  return `| **${row.score}** | ${company} | ${cell(row.title)} | ${cv} | ${Number(row.report_num)} | [open](${row.canonical_url}) |`;
+}
+
+function tableFor(rows, cvs) {
+  return [TABLE_HEAD, ...rows.map((r) => tableRow(r, cvs.get(String(Number(r.report_num)))))].join('\n');
 }
 
 function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan, marginalCap }) {
@@ -158,14 +163,14 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
   L.push('');
   L.push(`# Apply sheet — ${date}`);
   L.push('');
-  L.push(`> [!info] ${counts.total} live targets. Nothing here is submitted; ticking a box is your record, not an action.`);
+  L.push(`> [!info] ${counts.total} live targets, all liveness-checked today. Nothing here is submitted.`);
   L.push(`> Ranked within each group. Expired postings and anything already in the tracker are gone before you see this.`);
   L.push('');
 
   if (tiers.clean.length) {
     L.push(`## Send these first — named employer, ${minKeeper}+`);
     L.push('');
-    L.push(tiers.clean.map((r) => taskLine(r, cvs.get(String(Number(r.report_num))), outputDir)).join('\n'));
+    L.push(tableFor(tiers.clean, cvs));
     L.push('');
   }
 
@@ -179,7 +184,7 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
     L.push('> means nothing was there to pull the score down. A 4.1 here is not better than a 3.7');
     L.push('> from a named company.');
     L.push('');
-    L.push(tiers.anonymous.map((r) => taskLine(r, cvs.get(String(Number(r.report_num))), outputDir)).join('\n'));
+    L.push(tableFor(tiers.anonymous, cvs));
     L.push('');
   }
 
@@ -198,7 +203,7 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
       L.push(`> Run \`node apply-sheet.mjs --marginal-cap ${tiers.marginalTotal}\` to see all of them.`);
     }
     L.push('');
-    L.push(shown.map((r) => taskLine(r, cvs.get(String(Number(r.report_num))), outputDir)).join('\n'));
+    L.push(tableFor(shown, cvs));
     L.push('');
   }
 
@@ -207,7 +212,7 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
     L.push('');
     L.push('> [!question] The page loaded but no apply control was found. Open it before writing anything.');
     L.push('');
-    L.push(tiers.uncertain.map((r) => taskLine(r, cvs.get(String(Number(r.report_num))), outputDir)).join('\n'));
+    L.push(tableFor(tiers.uncertain, cvs));
     L.push('');
   }
 
@@ -255,7 +260,7 @@ function writeIndex(sheetsDir) {
 
 async function main() {
   const vault = flag('--vault', DEFAULT_VAULT);
-  const min = Number(flag('--min', '3.0'));
+  const min = Number(flag('--min', '3.5'));
   const minKeeper = Number(flag('--keeper', '3.5'));
   const marginalCap = Number(flag('--marginal-cap', '20'));
   const outputDir = join(HERE, 'output');
