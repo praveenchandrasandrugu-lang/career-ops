@@ -9,6 +9,13 @@ data/follow-ups.md
 data/salary-observations.tsv
 data/pipeline.md
 data/apply-queue.md
+# Dated hand-off sheets: the day's ranked shortlist with apply URLs. Same trust
+# level as apply-queue.md, and data/ is ignored file-by-file here rather than
+# wholesale, so a new user-layer filename is public until it is named.
+data/apply-sheet-*.md
+# Agent scratch at the repo root. Belongs in the session scratchpad; ignored so a
+# stray run cannot publish a working set of job URLs.
+.tmp-*
 data/scan-history.tsv
 data/scan-runs.tsv
 data/pdf-index.tsv

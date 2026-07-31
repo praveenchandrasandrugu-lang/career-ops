@@ -254,8 +254,15 @@ tab-separated columns:
 Status before score in the TSV; `merge-tracker.mjs` swaps them for the tracker. Status
 must be canonical per `templates/states.yml` (`Evaluated` here). The report link is
 always root-relative. If the posting came via an agency, append a labelled
-`via={Agency}` field; the label is mandatory. Unknown end employer: company is `?` and
-the descriptor goes in notes.
+`via={Agency}` field; the label is mandatory.
+
+**Unknown end employer:** company is `?`, the descriptor goes in notes, **and a
+`via={Channel}` field is REQUIRED** — these are one rule, not two. `verify-pipeline.mjs`
+treats a `?` company with an empty Via as an error, so writing `?` alone produces a row
+that fails the health check. When the ad is an anonymized repost rather than an agency
+placement, name the board it was found on (an ad on `jobs.lever.co/jobgether` that says
+"listed on behalf of a partner company" is `via=Jobgether`). There is no case where the
+employer is unknown and the channel is also unrecorded: something served the ad.
 
 ---
 
