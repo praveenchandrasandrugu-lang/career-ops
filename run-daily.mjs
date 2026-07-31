@@ -66,11 +66,23 @@ export const STAGES = [
     // see "0x, 100x, abinbev, abnormalsecurity..." every single day and never
     // reach the rest of the alphabet. Shuffled, each run samples a different
     // slice and coverage accumulates across days instead of standing still.
-    base: ['--since', '7', '--limit', '600', '--shuffle'],
+    // --since 3, NOT 7, and the reason is measured rather than aesthetic.
+    //
+    // 2026-07-31, same day, two pools: a hot-heavy one (87 of 99 rows posted
+    // within 4 days) returned 19 keepers at 3.5+, a 19% rate. A --since 7 sweep
+    // the same afternoon returned hot 11 / fresh 127 / backup 40, and the first
+    // 29 rows scored off that tail yielded 2 keepers, under 7%. The scorer sorts
+    // hot-first, so a 7-day window does not add good rows, it appends a stale
+    // tail that still costs a full paid evaluation each. Separately, Workday reqs
+    // decay 46% in 3 days, so much of that tail is already closed.
+    //
+    // Widening the window is the wrong lever for more keepers. The right one is a
+    // bigger --limit: more tenants at 3 days, not the same tenants at 7.
+    base: ['--since', '3', '--limit', '600', '--shuffle'],
     writes: [],
     dry: ['--dry-run'],
     costly: false,
-    note: 'network only, no model; 600 companies/ATS, shuffled',
+    note: 'network only, no model; 600 companies/ATS, shuffled, last 3 days',
   },
   {
     key: 'migrate',
