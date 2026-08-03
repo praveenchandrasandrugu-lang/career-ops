@@ -20,6 +20,7 @@
  *   node apply-sheet.mjs --vault D:/notes    # somewhere else
  *   node apply-sheet.mjs --dry-run           # print the plan, write nothing
  *   node apply-sheet.mjs --sync              # read your [x] ticks: mark Applied + write Applied/<date>.md
+ *   node apply-sheet.mjs --sync --date 2026-07-31   # ... from an earlier day's sheet
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -291,10 +292,14 @@ function tickedRows(notePath) {
  * here: a second writer to data/applications.md is exactly the thing set-status
  * exists to prevent.
  */
-function markApplied(rows, { dryRun }) {
+function markApplied(rows, { dryRun, date }) {
   const results = [];
   for (const r of rows) {
-    const args = [String(r.report), 'Applied', '--note', `Applied ${localDate()} via vault sheet`, '--json'];
+    // The note carries the sheet's date, not today's. followup-seed.mjs resolves
+    // its anchor from the "Applied YYYY-MM-DD" text in this note, so stamping
+    // today onto a sheet ticked three days ago would push every follow-up three
+    // days late for applications that already went out.
+    const args = [String(r.report), 'Applied', '--note', `Applied ${date} via vault sheet`, '--json'];
     if (dryRun) args.push('--dry-run');
     const status = spawnSync('node', ['set-status.mjs', ...args], { cwd: HERE, encoding: 'utf8' });
     const ok = status.status === 0;
@@ -416,7 +421,7 @@ async function sync({ vault, date }) {
     };
   });
 
-  const results = markApplied(rows, { dryRun: DRY });
+  const results = markApplied(rows, { dryRun: DRY, date });
   if (DRY) {
     console.log(JSON.stringify({ ok: true, dryRun: true, wouldMark: results.map((r) => ({ report: r.report, company: r.company, ok: r.ok, error: r.error })) }, null, 2));
     return;
@@ -431,7 +436,15 @@ async function main() {
   const minKeeper = Number(flag('--keeper', '3.5'));
   const marginalCap = Number(flag('--marginal-cap', '20'));
   const outputDir = join(HERE, 'output');
-  const date = localDate();
+  // A sheet is only syncable on the day it was published unless the day can be
+  // named. Ticks are recorded in the note and consumed by --sync, so a sheet
+  // ticked on Friday and synced on Monday would otherwise strand every
+  // application on it: --sync reads today's note, finds nothing, and exits ok.
+  const date = flag('--date', localDate());
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error(`--date must be YYYY-MM-DD: ${date}`);
+    process.exit(1);
+  }
 
   if (process.argv.includes('--sync')) return sync({ vault, date });
 

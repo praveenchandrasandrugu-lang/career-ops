@@ -152,6 +152,10 @@ portals-harsh.yml
 .edge-profile*/
 .tmp-chrome-profile*/
 .tmp-edge-profile*/
+# Playwright's downloaded browsers. chrome-headless-shell.exe alone is 193MB,
+# well past GitHub's 100MB file limit, so a stray `git add -A` produces a commit
+# that cannot be pushed at all.
+.pw-browsers/
 
 # Batch working manifests (per-run job lists, not system code)
 batch/*-manifest.json
