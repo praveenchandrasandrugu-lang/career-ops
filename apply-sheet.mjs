@@ -66,8 +66,16 @@ function closedReportNums(trackerPath) {
   const closed = new Set();
   for (const line of readFileSync(trackerPath, 'utf8').split('\n')) {
     if (!CLOSED_STATES.test(line)) continue;
-    const m = line.match(/reports\/(\d+)-/);
-    if (m) closed.add(String(Number(m[1])));
+    // Two numbers can identify one closed application: the row's own # and the
+    // report it links to. They diverge when a duplicate posting is collapsed
+    // onto a single row — #564 links to report 580, #570 to 619 — and reading
+    // only the link leaves the queue row under the other number looking unsent.
+    // That is how Tempus and O'Reilly returned to the sheet as fresh targets
+    // the day after they were applied to.
+    const link = line.match(/reports\/(\d+)-/);
+    if (link) closed.add(String(Number(link[1])));
+    const rowNum = line.match(/^\s*\|\s*(\d+)\s*\|/);
+    if (rowNum) closed.add(String(Number(rowNum[1])));
   }
   return closed;
 }
