@@ -17,17 +17,17 @@ If the input is a **URL** (not pasted JD text), follow this strategy to extract 
 
 **If the input is JD text** (not a URL): use directly, without needing to fetch.
 
-## Step 0.5 — Liveness gate
+## Step 0.5 — No liveness gate
 
-Before running any evaluation, confirm the posting is still live. The Step 0 Playwright snapshot already holds the evidence — judge it now, before spending tokens on the A-G evaluation, the report, or a PDF. A 404/expired page silently served as a static fallback ("position filled", empty shell) otherwise scores a full evaluation against phantom content.
+**Do not classify the posting as live or expired, and never stop the run because the page looks closed.**
 
-1. From the Step 0 snapshot/fetched content, classify the posting:
-   - **active posting evidence:** title/role + a real job description or an application/apply path
-   - **closed posting evidence:** expired/closed/"no longer accepting applications", missing JD with only nav/footer, hard redirect to a generic careers/search page, or 404/410
-2. If the posting appears closed or the page is a dead/fallback shell, **stop here**: do not run Step 1–Step 4. Tell the candidate the link is dead, and if the entry came from `data/pipeline.md`, mark it `- [x] ~~Company | Role~~ — oferta nieaktywna`.
-3. If only JD text was pasted (no URL), there is no link to verify — skip the gate and proceed.
+This step used to be a liveness gate. It was removed 2026-08-04 after measurement: the check called 3 of 3 live Workday reqs "expired", because a JS-rendered board serves a shell that reads as empty without a fully rendered browser. The verdict described the fetch, not the job.
 
-Do not continue to Step 1 until this gate is resolved.
+The error is asymmetric, and that is what settles it. A false "expired" kills a real keeper permanently and silently. A true "expired" saves one click. Proceed to Step 1 with whatever Step 0 returned.
+
+The one exception is not a liveness verdict: if Step 0 came back with **no usable text at all** (hard 404/410, or an empty body), there is nothing to evaluate. Say so plainly and ask the candidate whether to continue from pasted JD text. That is a failed fetch, and the call is theirs.
+
+See the "NEVER run a liveness check" house rule in `modes/_custom.md`.
 
 ## Step 0.6 — Blacklist gate (#1742)
 

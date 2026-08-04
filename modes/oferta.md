@@ -2,18 +2,17 @@
 
 When the candidate pastes a job (text or URL), ALWAYS deliver the 7 blocks (A-F evaluation + G legitimacy):
 
-## Liveness gate (URL inputs)
+## Fetch the ad (URL inputs)
 
-When the candidate pastes a **URL** (not JD text), confirm the posting is still live before doing any evaluation. A dead link must never reach Block A — a 404/expired page wastes a full A-G evaluation, report, and PDF on phantom content.
+When the candidate pastes a **URL** (not JD text), load the page so Block A has the real
+ad to work from.
 
-1. Get the page content: if you arrived here from `auto-pipeline` (its Step 0.5 already navigated and cleared the link), reuse that snapshot — do not navigate again. On a direct URL entry, navigate with Playwright (`browser_navigate` + `browser_snapshot`) and read the title, URL, and visible content. **Opt-in:** if `scan.extractor: cli` is set in `config/profile.yml`, run `node browser-extract.mjs <url>` (default `--mode jd`) instead and use its compact `{ "url", "title", "text" }` (the distilled JD main text rather than the full page a11y tree — fewer tokens for the model, board-dependent), **falling back silently** to `browser_navigate` + `browser_snapshot` if it errors or is missing.
-2. Classify the posting:
-   - **active posting evidence:** title/role + a real job description or an application/apply path
-   - **closed posting evidence:** expired/closed/"no longer accepting applications", missing JD with only nav/footer, hard redirect to a generic careers/search page, or 404/410
-3. If the posting appears closed, **stop before Block A**: tell the candidate the link is dead, and if the entry came from `data/pipeline.md`, mark it `- [x] ~~Company | Role~~ — oferta nieaktywna`. Do not generate an evaluation, report, or CV.
-4. If the candidate pasted JD text (no URL), liveness cannot be verified — note that and proceed; there is no link to check.
+1. Get the page content: if you arrived here from `auto-pipeline` (its Step 0.5 already navigated), reuse that snapshot — do not navigate again. On a direct URL entry, navigate with Playwright (`browser_navigate` + `browser_snapshot`) and read the title, URL, and visible content. **Opt-in:** if `scan.extractor: cli` is set in `config/profile.yml`, run `node browser-extract.mjs <url>` (default `--mode jd`) instead and use its compact `{ "url", "title", "text" }` (the distilled JD main text rather than the full page a11y tree — fewer tokens for the model, board-dependent), **falling back silently** to `browser_navigate` + `browser_snapshot` if it errors or is missing.
+2. **Do NOT classify the posting as live or expired, and never stop the evaluation because it looks closed.** Liveness checking was REMOVED 2026-08-04: it called 3 of 3 live Workday reqs expired, because a JS-rendered board serves a shell that reads as empty without a browser. A wrong "expired" verdict throws away a real keeper permanently; a right one saves a single click. See the "NEVER run a liveness check" house rule in `modes/_custom.md`.
+3. If the fetch returns genuinely nothing usable (hard 404/410, or no text at all), say so plainly and ask the candidate whether to continue from pasted JD text. That is a failed *fetch*, not a liveness verdict, and it is the candidate's call.
+4. If the candidate pasted JD text (no URL), proceed directly; there is no page to load.
 
-Do not continue to Block A until this gate is resolved. The snapshot captured here is reused by Block G's freshness signals.
+The snapshot captured here is reused by Block G's freshness signals.
 
 ## Blacklist gate (#1742)
 
@@ -214,7 +213,7 @@ Analyze the job posting for signals that indicate whether this is a real, active
 
 ### Signals to analyze (in order):
 
-**1. Posting Freshness** (from the Playwright snapshot captured during the liveness gate, or in `auto-pipeline` Step 0; unavailable if only JD text was pasted):
+**1. Posting Freshness** (from the Playwright snapshot captured when the ad was fetched, or in `auto-pipeline` Step 0; unavailable if only JD text was pasted):
 - Date posted or "X days ago" -- extract from page
 - Apply button state (active / closed / missing / redirects to generic page)
 - If URL redirected to generic careers page, note it

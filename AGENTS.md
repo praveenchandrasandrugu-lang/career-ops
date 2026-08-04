@@ -127,7 +127,7 @@ AI-powered, CLI-agnostic job search automation: pipeline tracking, offer evaluat
 | `scan.mjs` | Zero-token portal scanner — hits Greenhouse/Ashby/Lever APIs directly, zero LLM cost |
 | `scan-ats-full.mjs` | Reverse-ATS keyword-first scanner — walks the full public job-board-aggregator dataset per ATS provider (Greenhouse/Lever/Ashby/Workday), filtered by portals.yml's title_filter/location_filter. No company-list curation needed; complements scan.mjs's company-first model. |
 | `reset-pool.mjs` | Discards the pending job pool and starts from an empty one (`--apply`; dry run by default). **Clearing `data/queue.db` alone does nothing** — it is a derived view that `queue-migrate.mjs` rebuilds from `data/pipeline.md`, so the stale pool silently returns on the next run. This clears both and archives them to `data/archive/`. Keeps `data/scan-history.tsv` and `data/applications.md` on purpose, so the refill cannot replay postings already seen or already applied to. |
-| `check-liveness.mjs` | Job posting liveness checker |
+| `check-liveness.mjs` | REMOVED 2026-08-04 — refusal stub. Liveness checking produced false "expired" verdicts (3 of 3 live Workday reqs) and dropped real keepers. Nothing checks liveness. |
 | `liveness-core.mjs` | Shared liveness logic (expired signals win over generic Apply text) |
 | `reports/` | Evaluation reports (format: `{###}-{company-slug}-{YYYY-MM-DD}.md`). Blocks A-D + G (Posting Legitimacy; E and F were cut 2026-07-24). Header includes `**Legitimacy:** {tier}`. |
 
@@ -358,14 +358,22 @@ These are two separate axes:
 
 ---
 
-## Offer Verification -- MANDATORY
+## Offer Verification -- REMOVED 2026-08-04
 
-**NEVER trust WebSearch/WebFetch to verify if an offer is still active.** ALWAYS use Playwright:
-1. `browser_navigate` to the URL
-2. `browser_snapshot` to read content
-3. Only footer/navbar without JD = closed. Title + description + Apply = active.
+**Do NOT verify whether an offer is still active. There is no liveness check anywhere in this system.**
 
-**Exception for batch workers (headless mode):** Playwright is not available in headless pipe mode. Use WebFetch as fallback and mark the report header with `**Verification:** unconfirmed (batch mode)`. The user can verify manually later.
+The previous rule made Playwright verification mandatory before evaluation. It was removed after measurement: the checker classified 3 of 3 live Workday reqs as "expired", because a JS-rendered board serves a shell that reads as "insufficient content" without a fully rendered browser. The verdict described the fetch, not the job.
+
+The error is asymmetric, which is what settles it. A false "expired" silently deletes a real keeper, and nothing ever resurfaces it. A true "expired" saves one click on a dead link. Never trade the first for the second.
+
+- Do not run `check-liveness.mjs` (it is a refusal stub and exits 2).
+- Do not pass `--verify` or `--liveness` to any scanner.
+- Do not open Playwright to confirm a posting is still open.
+- Do not drop, downgrade, skip or flag a row because a link might be dead.
+
+Fetching a page to **read the ad** is still correct and still required — that is content extraction, not liveness. If a fetch returns nothing usable, say so plainly and let the user decide; that is a failed fetch, not a verdict on the job.
+
+`liveness-core.mjs`, `liveness-api.mjs` and `liveness-browser.mjs` remain on disk only because unrelated code imports non-liveness helpers from them (`resolveAtsApi`, `isAtsPosting`, the SSRF host guard).
 
 ---
 

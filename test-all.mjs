@@ -1426,17 +1426,21 @@ for (const skillPath of ['.claude/skills/career-ops/SKILL.md', '.agents/skills/c
   }
 }
 
+// Liveness removed 2026-08-04. The preflight must keep its ROLE-MATCH duty (the
+// part that stops a CV going to the wrong req) while never checking liveness.
+// Asserting both halves is deliberate: deleting the gate wholesale would also
+// have deleted the company/role mismatch check, which is the valuable half.
 const applyMode = readFile('modes/apply.md');
 if (
   applyMode.includes('## Step 5 — Preflight gate') &&
-  applyMode.includes('verify liveness with Playwright') &&
+  applyMode.includes('**Do NOT verify liveness.**') &&
   applyMode.includes('matching report has been loaded') &&
   applyMode.includes('Do not continue to Step 6 until this preflight is resolved') &&
-  applyMode.includes('refuse to generate final copy')
+  !applyMode.includes('verify liveness with Playwright')
 ) {
-  pass('apply mode includes liveness and role-match preflight gate');
+  pass('apply mode keeps the role-match preflight and does not check liveness');
 } else {
-  fail('apply mode missing liveness/role-match preflight gate');
+  fail('apply mode preflight is missing the role-match gate or still checks liveness');
 }
 
 if (
@@ -1555,17 +1559,20 @@ if (
 
 const ofertaMode = readFile('modes/oferta.md');
 const autoPipelineMode = readFile('modes/auto-pipeline.md');
+// The eval modes must still FETCH the ad (Block A and Block G both need it) but
+// must never judge it live or dead. 'closed posting evidence' was the phrase that
+// drove the old stop-the-run branch, so its absence is the regression guard.
 if (
-  ofertaMode.includes('## Liveness gate (URL inputs)') &&
-  ofertaMode.includes('closed posting evidence') &&
-  ofertaMode.includes('Do not continue to Block A until this gate is resolved') &&
-  autoPipelineMode.includes('## Step 0.5 — Liveness gate') &&
-  autoPipelineMode.includes('closed posting evidence') &&
-  autoPipelineMode.includes('Do not continue to Step 1 until this gate is resolved')
+  ofertaMode.includes('## Fetch the ad (URL inputs)') &&
+  ofertaMode.includes('**Do NOT classify the posting as live or expired') &&
+  !ofertaMode.includes('closed posting evidence') &&
+  autoPipelineMode.includes('## Step 0.5 — No liveness gate') &&
+  autoPipelineMode.includes('**Do not classify the posting as live or expired') &&
+  !autoPipelineMode.includes('closed posting evidence')
 ) {
-  pass('eval modes (oferta/auto-pipeline) gate dead links before evaluation');
+  pass('eval modes (oferta/auto-pipeline) fetch the ad without judging it live or dead');
 } else {
-  fail('eval modes missing liveness gate before evaluation');
+  fail('eval modes still gate on liveness, or no longer fetch the ad');
 }
 
 if (
@@ -1800,17 +1807,18 @@ if (
   fail('batch prompt missing company-type compensation reliability checks');
 }
 
+// The batch liveness sweep is gone. check-liveness.mjs is a refusal stub that
+// exits 2, so a mode still naming it as a command would break pipeline mode
+// outright — hence the negative assertion rather than a doc-only check.
 const pipelineMode = readFile('modes/pipeline.md');
 if (
-  pipelineMode.includes('## Liveness sweep') &&
-  pipelineMode.includes('check-liveness.mjs') &&
-  pipelineMode.includes('unconfirmed') &&
-  pipelineMode.includes('Do not') &&
-  pipelineMode.includes('liveness sweep')
+  pipelineMode.includes('## No liveness sweep') &&
+  pipelineMode.includes('Liveness checking was REMOVED 2026-08-04') &&
+  !pipelineMode.includes('node check-liveness.mjs')
 ) {
-  pass('pipeline mode sweeps unconfirmed entries for liveness before processing');
+  pass('pipeline mode processes every pending URL and runs no liveness sweep');
 } else {
-  fail('pipeline mode missing batch liveness sweep for unconfirmed entries');
+  fail('pipeline mode still sweeps for liveness or still invokes check-liveness.mjs');
 }
 
 // --- salary tracking mode wiring (#1656 PR-2) ---

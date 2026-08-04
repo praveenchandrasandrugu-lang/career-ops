@@ -2,25 +2,21 @@
 
 Process job URLs stored in `data/pipeline.md`. The user adds URLs at any time and then executes `/career-ops pipeline` to process them all.
 
-## Liveness sweep
+## No liveness sweep
 
-**Run this before processing any URLs.** Entries added by the scanner in headless/batch mode carry `**Verification:** unconfirmed (batch mode)` because Playwright was unavailable at scan time — they were never checked for liveness. Without a sweep, dead postings reach evaluation one tab at a time, burning time and tokens on phantom roles (a single inbox of 8 stale URLs produces 8 wasted evaluations).
-
-Sweep all pending URLs in one batch with the zero-token liveness checker before the per-URL loop:
-
-1. Collect every `- [ ]` URL from the "Pending" section into a temp file (one URL per line).
-2. Run `node check-liveness.mjs --file <tmpfile>` (add `--throttle` for large batches to stay under WAF rate limits; it's pure Playwright, zero Claude tokens). The checker prints a per-URL verdict and exits non-zero if any are expired/uncertain.
-3. For every URL the checker reports as **expired/closed**, resolve the pipeline entry instead of processing it: move it to "Processed" as `- [x] ~~URL | Company | Role~~ — posting expired (liveness sweep)` and, if it already has a tracker row, mark it `Discarded`. **Do not** extract the JD, evaluate, or generate a report/PDF for it.
-4. Leave `uncertain` results in place to be confirmed during normal per-URL extraction (a transient timeout shouldn't drop a possibly-live posting).
-5. Only the surviving live URLs continue to the per-URL processing loop below.
-
-This complements — does not replace — the per-URL liveness gate in `auto-pipeline` (Step 0.5) and the `apply` preflight: the sweep drops the dead postings up front, in bulk, so the user never opens a tab or spends a token on them.
+Liveness checking was REMOVED 2026-08-04. Do not sweep, probe, or verify that a
+pending URL is still open, and never drop an entry for being "expired". The old
+sweep called 3 of 3 live Workday reqs expired, because a JS-rendered board reads
+as empty without a browser, and every false verdict deleted a real keeper. Process
+every pending URL. If one is genuinely dead, the extraction step will find that out
+for the cost of a single fetch. See the "NEVER run a liveness check" house rule in
+`modes/_custom.md`.
 
 ## Pre-screen gate (standard / premium tiers only)
 
 Read `spend_tier` from `config/profile.yml` (see `modes/_shared.md` -- Spend Tier section; defaults to `standard` if absent).
 
-- **`standard` or `premium` tier:** Before running the full A-F evaluation on a pending URL that survived the liveness sweep, run a cheap pre-screen pass using the tier's economy-equivalent model (see the mapping table in `modes/_shared.md`) against the candidate's North Star archetypes (`modes/_profile.md`). If the JD is an obvious mismatch, skip the full evaluation: mark it `- [x] #-- | {url} | skipped (pre-screen mismatch: {reason})` in "Processed" and continue to the next URL.
+- **`standard` or `premium` tier:** Before running the full A-F evaluation on a pending URL, run a cheap pre-screen pass using the tier's economy-equivalent model (see the mapping table in `modes/_shared.md`) against the candidate's North Star archetypes (`modes/_profile.md`). If the JD is an obvious mismatch, skip the full evaluation: mark it `- [x] #-- | {url} | skipped (pre-screen mismatch: {reason})` in "Processed" and continue to the next URL.
 - **`economy` tier:** No gate. The tier is already the cheapest available. Every surviving pending URL goes straight to the full evaluation.
 - This gate only applies to pipeline/batch processing. It never applies to a single interactive evaluation.
 
@@ -28,7 +24,7 @@ Read `spend_tier` from `config/profile.yml` (see `modes/_shared.md` -- Spend Tie
 
 ## Workflow
 
-1. **Read** `data/pipeline.md` → search for `- [ ]` items in the "Pending" section. Run the **Liveness sweep** (above) first and drop any expired entries before continuing.
+1. **Read** `data/pipeline.md` → search for `- [ ]` items in the "Pending" section. Process all of them; there is no liveness sweep and nothing is dropped for looking expired.
 2. **For each surviving pending URL**:
    a. **Extract JD** using Playwright (browser_navigate + browser_snapshot) → WebFetch → WebSearch
    b. If the URL is not accessible → mark as `- [!]` with a note and continue

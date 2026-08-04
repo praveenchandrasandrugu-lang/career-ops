@@ -1,125 +1,31 @@
 #!/usr/bin/env node
-
 /**
- * check-liveness.mjs — Playwright job link liveness checker
+ * check-liveness.mjs — REMOVED 2026-08-04.
  *
- * Tests whether job posting URLs are still active or have expired.
- * Uses the same detection logic as scan.md step 7.5.
- * Zero Claude API tokens. Two rungs: a free ATS API check first
- * (Greenhouse/Lever — no browser), then Playwright for everything else.
+ * This was a Playwright/API job-link liveness checker. It is now a refusal stub,
+ * and the reason is measured rather than aesthetic: it called 3 of 3 live Workday
+ * reqs "expired". A JS-rendered board serves a shell that reads as "insufficient
+ * content" without a browser, so the verdict described the fetch, not the job.
  *
- * Usage:
- *   node check-liveness.mjs <url1> [url2] ...
- *   node check-liveness.mjs --file urls.txt
+ * The error was asymmetric. A false "expired" silently deleted a real keeper from
+ * the apply sheet, and nothing ever resurfaced it. A true "expired" saved one
+ * click on a dead link. Paying a keeper to save a click is the wrong trade, so
+ * the whole check is gone rather than tuned.
  *
- * Exit code: 0 if all active, 1 if any expired or uncertain
+ * The file survives as a stub instead of being deleted because it is a SYSTEM_PATH
+ * in update-system.mjs: a deleted system file returns on the next update, and it
+ * would return as the working checker. A stub that refuses cannot silently resume.
+ *
+ * Deliberately no imports. The previous version statically imported Playwright and
+ * the liveness modules, which meant paying the module load before refusing.
+ *
+ * The liveness-*.mjs modules are still present and still exercised by test-all,
+ * because unrelated code imports non-liveness helpers from them: resolveAtsApi and
+ * isAtsPosting (screen-level.mjs, screen-sponsorship.mjs) and the SSRF host guard
+ * plus LIVENESS_CONTEXT_OPTIONS (browser-extract.mjs).
  */
 
-import { chromium } from 'playwright';
-import { readFile } from 'fs/promises';
-import {
-  checkUrlLivenessWithFallback,
-  createHeadedPageProvider,
-  newLivenessPage,
-  jitteredDelayMs,
-  sleep,
-} from './liveness-browser.mjs';
-import { checkLivenessViaApi } from './liveness-api.mjs';
-
-async function main() {
-  // REMOVED 2026-08-04 on the user's instruction. Measured: this checker called
-  // 3 of 3 live Workday reqs "expired", because a JS-rendered shell reads as
-  // "insufficient content" without a browser. Every false expired verdict
-  // deletes a real keeper that is never surfaced again, while the only thing a
-  // true verdict saves is one click on a dead link. The trade was never worth it.
-  console.error('check-liveness.mjs was removed: it produced false "expired" verdicts and dropped live jobs.');
-  console.error('Nothing in the pipeline checks liveness any more. Open the link; that is the check.');
-  process.exit(2);
-  /* eslint-disable no-unreachable */
-  const args = process.argv.slice(2);
-
-  // Portals like pracuj.pl serve a Cloudflare anti-bot wall to headless Chromium.
-  // On a challenge we retry once in a headed browser (which clears it); pass
-  // --no-fallback to stay fully headless (e.g. on a machine with no display).
-  const noFallback = args.includes('--no-fallback');
-  // --throttle or --throttle=<ms>: wait base..2*base ms (jittered) between checks
-  // to stay under rate-based WAF limits. pracuj.pl's Cloudflare flags the session
-  // after ~2 rapid hits, so a bulk run needs spacing. Default base 5000ms.
-  const throttleArg = args.find((a) => a === '--throttle' || a.startsWith('--throttle='));
-  const throttleBaseMs = throttleArg ? (Number(throttleArg.split('=')[1]) || 5000) : 0;
-  const positional = args.filter((a) => a !== '--no-fallback' && a !== throttleArg);
-
-  if (positional.length === 0) {
-    console.error('Usage: node check-liveness.mjs [--no-fallback] [--throttle[=ms]] <url1> [url2] ...');
-    console.error('       node check-liveness.mjs [--no-fallback] [--throttle[=ms]] --file urls.txt');
-    process.exit(1);
-  }
-
-  let urls;
-  if (positional[0] === '--file') {
-    const text = await readFile(positional[1], 'utf-8');
-    urls = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-  } else {
-    urls = positional;
-  }
-
-  const notes = [
-    noFallback ? null : 'headed fallback on challenge',
-    throttleBaseMs ? `throttle ~${throttleBaseMs / 1000}-${(throttleBaseMs * 2) / 1000}s` : null,
-  ].filter(Boolean);
-  console.log(`Checking ${urls.length} URL(s)...${notes.length ? ` (${notes.join(', ')})` : ''}\n`);
-
-  // Lazy browser: the API rung resolves ATS postings with no browser at all, so we
-  // only launch Playwright if a URL actually needs the fallback.
-  let browser = null, page = null, headed = null;
-  async function ensureBrowser() {
-    if (browser) return;
-    browser = await chromium.launch({ headless: true });
-    page = await newLivenessPage(browser);
-    headed = noFallback ? null : createHeadedPageProvider(chromium);
-  }
-
-  let active = 0, expired = 0, uncertain = 0, viaApi = 0;
-
-  // Sequential — project rule: never Playwright in parallel
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    let result, reason, usedBrowser = false;
-
-    // Rung 1: zero-token ATS API check. A conclusive active/expired wins; otherwise fall through.
-    const api = await checkLivenessViaApi(url);
-    if (api) {
-      ({ result, reason } = api);
-      viaApi++;
-    } else {
-      // Rung 2: Playwright — handles non-ATS pages and inconclusive API results.
-      await ensureBrowser();
-      const getHeadedPage = headed ? () => headed.get() : undefined;
-      ({ result, reason } = await checkUrlLivenessWithFallback(page, url, { getHeadedPage }));
-      usedBrowser = true;
-    }
-
-    const icon = { active: '✅', expired: '❌', uncertain: '⚠️' }[result];
-    console.log(`${icon} ${result.padEnd(10)} ${api ? '(api) ' : '      '}${url}`);
-    if (result !== 'active') console.log(`           ${reason}`);
-    if (result === 'active') active++;
-    else if (result === 'expired') expired++;
-    else uncertain++;
-
-    // Throttle only matters between browser checks (the API is cheap, not WAF-rate-limited).
-    const wait = usedBrowser && i < urls.length - 1 ? jitteredDelayMs(throttleBaseMs) : 0;
-    if (wait) await sleep(wait);
-  }
-
-  if (headed) await headed.close();
-  if (browser) await browser.close();
-
-  console.log(`\nResults: ${active} active  ${expired} expired  ${uncertain} uncertain  (${viaApi} via API, no browser)`);
-  if (expired > 0 || uncertain > 0) process.exit(1);
-  /* eslint-enable no-unreachable */
-}
-
-main().catch(err => {
-  console.error('Fatal:', err.message);
-  process.exit(1);
-});
+console.error('check-liveness.mjs was removed: it produced false "expired" verdicts and dropped live jobs.');
+console.error('Nothing in the pipeline checks liveness any more. Open the link; that is the check.');
+console.error('See the "NEVER run a liveness check" house rule in modes/_custom.md.');
+process.exit(2);

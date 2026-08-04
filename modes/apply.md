@@ -16,7 +16,7 @@ Interactive mode for when the candidate is filling out an application form in Ch
 2. IDENTIFY    → Extract company + role from the page
 3. SEARCH      → Match against existing reports in reports/
 4. LOAD        → Read full report + Section H / Application Answers (if they exist)
-5. PREFLIGHT   → Confirm posting liveness + company/role match before drafting
+5. PREFLIGHT   → Confirm company/role match before drafting
 5b. PRE-SCAN   → Scan page for knock-out questions (degree, experience, work authorization/visa, sponsorship, salary floors)
 6. ANALYZE     → Identify ALL visible form questions
 7. GENERATE    → For each question, generate a personalized response
@@ -36,15 +36,12 @@ Before generating any application answers, verify that the form still points to 
 2. If the name is not available, check the tracker for `?` rows with the same Via + a similar role (the same agency re-blasting one listing) and for similar-role rows at plausible-match companies; surface anything close.
 3. Then STOP and require explicit user acknowledgment before the agency is authorized: "The end employer is unknown, so I cannot verify you haven't already applied to this company directly. Authorize anyway?" Never proceed on silence — the reveal-time check only catches damage after the fact.
 
-1. Read the visible URL, page title, company, role, and any closed/expired signals.
-2. If a URL is available, verify liveness with Playwright:
-   - active posting evidence: title/role + job description or form fields + submit/apply path
-   - closed posting evidence: expired/closed/no longer accepting applications, missing JD with only nav/footer, hard redirect to generic careers/search, or 404/410
-3. Compare the visible company and role against the matched report.
+1. Read the visible URL, page title, company, and role.
+2. **Do NOT verify liveness.** Liveness checking was REMOVED 2026-08-04 (see the "NEVER run a liveness check" house rule in `modes/_custom.md`), and it never belonged here regardless: the candidate is looking at the application form. If the posting were closed, there would be no form to fill.
+3. Compare the visible company and role against the matched report. **This role-match check is the real purpose of the preflight** and it still runs in full.
 4. If company or title changed materially, stop before drafting and ask:
    "The form appears to be for [visible company] — [visible role], but the matched report is [report company] — [report role]. Do you want me to re-evaluate, adapt with this mismatch, or stop?"
-5. If the posting appears closed, refuse to generate final copy unless the candidate explicitly overrides with a known reason.
-6. If liveness cannot be verified because the candidate only pasted questions or a screenshot, state that limitation and ask the candidate to confirm the company, role, and active posting before drafting.
+5. If the candidate only pasted questions or a screenshot, the company and role cannot be read from the page. State that limitation and ask the candidate to confirm both before drafting.
 
 Do not continue to Step 6 until this preflight is resolved.
 
@@ -65,7 +62,7 @@ Read the entire page/form to scan for knock-out questions BEFORE generating full
    - Stop and wait for the candidate's confirmation before drafting any further answers.
 4. If no knock-out questions are found, or the candidate resolves the warning, proceed to Step 6.
 
-**Applying to several roles in one sitting?** This preflight verifies the single form in front of you. Before a multi-role session — especially against scanner entries marked `**Verification:** unconfirmed (batch mode)` — run the `pipeline` mode **Liveness sweep** first (`node check-liveness.mjs --file <urls>`). It drops the dead postings from `data/pipeline.md` in one batch so you never open a tab on an expired role.
+**Applying to several roles in one sitting?** This preflight verifies the single form in front of you; run it again for each role. Do not batch-check the URLs first — liveness checking was removed 2026-08-04 and `check-liveness.mjs` now refuses.
 
 ## Step 1 — Detect the job
 
