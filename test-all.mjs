@@ -8120,6 +8120,92 @@ try {
   fail(`test layout guard: ${e.message}`);
 }
 
+// ── apply-sheet.mjs — the sheet and its reader must agree (#2026-08-04) ──────
+//
+// The sheet is the ONLY record of what was sent. checklistFor() renders the
+// tickable line and tickedRows() reads it back, and they are edited months
+// apart. When the score was added in front of the report number, tickedRows'
+// anchored regex stopped matching and `--sync` returned zero rows: no error, no
+// warning, an "ok" exit, and every application silently unrecorded. That is the
+// same failure shape that stranded 20 applications for three days. These tests
+// exist so the renderer can never drift away from its parser again.
+try {
+  const sheet = await import(pathToFileURL(join(ROOT, 'apply-sheet.mjs')).href);
+  const rows = [
+    { report_num: 943, score: 4.2, company: 'Lightspeed Systems', title: 'Business Analyst', canonical_url: 'https://example.com/943' },
+    { report_num: '880', score: 3.6, company: 'Booz Allen Hamilton', title: 'Public Health Business Analyst', canonical_url: 'https://example.com/880' },
+    { report_num: 999, score: 4, company: '?', title: 'Mystery Role', canonical_url: 'https://example.com/999' },
+  ];
+  const cvs = new Map([['943', 'cv-943-lightspeed-business-analyst.pdf'], ['880', 'cv-880-booz.pdf']]);
+  const notes = new Map([['943', 'Send this one first.']]);
+  const rendered = sheet.checklistFor(rows, cvs, notes);
+
+  // ROUND TRIP: tick every box, read it back, expect every report number.
+  const ticked = rendered.replace(/- \[ \]/g, '- [x]');
+  const tmp = join(tmpdir(), `apply-sheet-roundtrip-${process.pid}.md`);
+  writeFileSync(tmp, ticked, 'utf8');
+  const got = sheet.tickedRows(tmp).sort((a, b) => a - b);
+  rmSync(tmp, { force: true });
+  if (got.length === 3 && got[0] === 880 && got[1] === 943 && got[2] === 999) {
+    pass('apply-sheet: every ticked checklist row round-trips back through tickedRows');
+  } else {
+    fail(`apply-sheet round trip lost rows: expected [880,943,999], got ${JSON.stringify(got)}`);
+  }
+
+  // The line must carry everything needed to send: CV filename and apply link.
+  if (rendered.includes('cv-943-lightspeed-business-analyst.pdf') && rendered.includes('https://example.com/943')) {
+    pass('apply-sheet: checklist line carries the CV filename and the apply link');
+  } else {
+    fail('apply-sheet: checklist line is missing the CV filename or the apply link');
+  }
+
+  // A keeper with no CV must SAY so, not render an empty cell.
+  if (/NO CV/.test(rendered)) {
+    pass('apply-sheet: a keeper with no CV is called out on its line');
+  } else {
+    fail('apply-sheet: a missing CV renders silently instead of being called out');
+  }
+
+  // Scores render on one scale: 4 must read as 4.0, never as bare "4".
+  if (rendered.includes('**4.0**') && rendered.includes('**4.2**') && !/\*\*4\*\*/.test(rendered)) {
+    pass('apply-sheet: scores render to one decimal (4 reads as 4.0)');
+  } else {
+    fail('apply-sheet: score formatting is not one-decimal');
+  }
+
+  // Per-role notes land under their own row and nowhere else.
+  if (rendered.includes('Send this one first.') && !rendered.includes('⚠️ undefined')) {
+    pass('apply-sheet: per-role notes render under their row');
+  } else {
+    fail('apply-sheet: per-role note missing or leaked onto the wrong row');
+  }
+
+  // Callers that omit `notes` must not crash (buildNote is exported).
+  try {
+    sheet.checklistFor(rows, cvs);
+    pass('apply-sheet: checklistFor tolerates a caller that omits notes');
+  } catch (e) {
+    fail(`apply-sheet: checklistFor throws without notes: ${e.message}`);
+  }
+
+  // cvIndex must match BOTH naming conventions, or freshly built CVs vanish.
+  const cvDir = join(tmpdir(), `apply-sheet-cvs-${process.pid}`);
+  mkdirSync(cvDir, { recursive: true });
+  for (const f of ['cv-943-lightspeed.pdf', 'cv-candidate-912-uw-stout.pdf', 'cv-candidate-707-706-bi-analyst.pdf', 'notes.txt']) {
+    writeFileSync(join(cvDir, f), '', 'utf8');
+  }
+  const idx = sheet.cvIndex(cvDir);
+  rmSync(cvDir, { recursive: true, force: true });
+  if (idx.get('943') === 'cv-943-lightspeed.pdf' && idx.get('912') === 'cv-candidate-912-uw-stout.pdf'
+      && idx.get('707') === 'cv-candidate-707-706-bi-analyst.pdf' && idx.get('706') === 'cv-candidate-707-706-bi-analyst.pdf') {
+    pass('apply-sheet: cvIndex maps both cv-<num>- and cv-candidate-<num>- names, incl. multi-req CVs');
+  } else {
+    fail(`apply-sheet: cvIndex missed a naming convention: ${JSON.stringify([...idx])}`);
+  }
+} catch (e) {
+  fail(`apply-sheet tests: ${e.message}`);
+}
+
 await runDiscovered();
 
 finish();

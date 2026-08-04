@@ -239,7 +239,7 @@ function tableRow(row, cvFile) {
  * field needed to send an application now lives on the line you tick: score,
  * company, role, the exact PDF to attach, and the link.
  */
-function checklistFor(allRows, cvs, notes) {
+function checklistFor(allRows, cvs, notes = new Map()) {
   const L = ['## Mark as sent', '',
     '> [!tip] Everything you need is on the line. Attach the CV named there, open the link,',
     '> tick the box as you submit, then run `node apply-sheet.mjs --sync`.',
@@ -267,7 +267,7 @@ function tableFor(rows, cvs) {
   return [TABLE_HEAD, ...rows.map((r) => tableRow(r, cvs.get(String(Number(r.report_num)))))].join('\n');
 }
 
-function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, notes, marginalCap }) {
+function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, notes = new Map(), marginalCap }) {
   const L = [];
   L.push('---');
   L.push(`date: ${date}`);
@@ -358,7 +358,14 @@ function tickedRows(notePath) {
   for (const line of readFileSync(notePath, 'utf8').split('\n')) {
     // Only the checklist carries state. Obsidian writes `- [x]` when you click,
     // and accepts a typed X, so both forms are matched.
-    const m = line.match(/^\s*-\s*\[[xX]\]\s*`(\d+)`/);
+    //
+    // The `[^`]*` is load-bearing. checklistFor() puts the score before the
+    // report number (`- [x] **4.2** `943` ...`), and an anchored match on the
+    // number alone silently returned ZERO ticked rows — no error, just a sync
+    // that reports ok and records nothing. That is the same shape of failure as
+    // the date-keyed --sync bug: silence is not proof there was nothing to find.
+    // renders-and-parses.test in test-all.mjs pins the two together.
+    const m = line.match(/^\s*-\s*\[[xX]\]\s*[^`]*`(\d+)`/);
     if (m) reports.push(Number(m[1]));
   }
   // Details are read back from the queue, never re-parsed out of the rendered
@@ -544,7 +551,10 @@ async function main() {
     // Blacklisting matches on the queue's own slug, so swap the display name in
     // only after the row has survived that filter.
     .map((r) => ({ ...r, slug: r.company, company: names.get(String(Number(r.report_num))) ?? r.company }));
-  let rows = all.filter((r) => !blacklisted(r.slug));
+  // Check BOTH names: the ledger may hold "Booz Allen Hamilton" while the queue
+  // slug is `bah`, and matching only the slug would let a blacklisted employer
+  // through under a name the user never sees.
+  let rows = all.filter((r) => !blacklisted(r.slug) && !blacklisted(r.company));
   const blocked = all.length - rows.length;
   if (blocked) console.error(`blacklist: ${blocked} row(s) held back by data/blacklist.md`);
 
@@ -589,4 +599,4 @@ if (isMain || process.argv[1]?.endsWith('apply-sheet.mjs')) {
   main().catch((err) => { console.error(err); process.exit(1); });
 }
 
-export { closedReportNums, cvIndex, isAnonymous, tierOf, buildNote };
+export { closedReportNums, cvIndex, isAnonymous, tierOf, buildNote, checklistFor, tickedRows, applyNotes, displayNames };
