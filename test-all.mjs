@@ -8188,6 +8188,31 @@ try {
     fail(`apply-sheet: checklistFor throws without notes: ${e.message}`);
   }
 
+  // WORK AUTHORISATION must reach the sheet. Report 912's ad said "Sponsorship is
+  // not available for this position" and the report never printed it, so the only
+  // way to discover it was to open the ad. Under the STEM OPT rule that line does
+  // not disqualify — but "does not change the score" had been implemented as
+  // "does not get shown", and those are different things.
+  {
+    const withBlock = [{ report_num: 912, score: 4.1, company: 'UW-Stout', title: 'Business Analyst',
+      canonical_url: 'https://example.com/912',
+      workAuth: '**Ad says:** "Sponsorship is not available for this position." — not a bar on STEM OPT, but read it.' }];
+    const out = sheet.checklistFor(withBlock, new Map([['912', 'cv-912.pdf']]), new Map());
+    if (out.includes('🛂') && out.includes('Sponsorship is not available')) {
+      pass('apply-sheet: an ad\u2019s work-authorisation language is quoted on its row');
+    } else {
+      fail('apply-sheet: work-authorisation language does not reach the sheet');
+    }
+    // A row with no work-auth language must not render an empty marker.
+    const clean = sheet.checklistFor([{ report_num: 939, score: 4.1, company: 'Waystar', title: 'Data Engineer',
+      canonical_url: 'https://example.com/939', workAuth: null }], new Map([['939', 'cv-939.pdf']]), new Map());
+    if (!clean.includes('🛂')) {
+      pass('apply-sheet: a row with no work-auth language renders no marker');
+    } else {
+      fail('apply-sheet: rendered an empty work-auth marker');
+    }
+  }
+
   // cvIndex must match BOTH naming conventions, or freshly built CVs vanish.
   const cvDir = join(tmpdir(), `apply-sheet-cvs-${process.pid}`);
   mkdirSync(cvDir, { recursive: true });

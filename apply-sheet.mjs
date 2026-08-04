@@ -22,6 +22,7 @@
  *   node apply-sheet.mjs --sync --date 2026-07-31   # ... from an earlier day's sheet
  */
 import { spawnSync } from 'node:child_process';
+import { classifyText } from './screen-sponsorship.mjs';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -130,6 +131,29 @@ function applyNotes(path) {
     byReport.set(key, prev ? `${prev} ${m[2].trim()}` : m[2].trim());
   }
   return byReport;
+}
+
+/**
+ * The ad's own work-authorisation language, quoted, or null.
+ *
+ * Zero tokens and zero network: classifyText() runs over the JD already stored
+ * on the row. It is deliberately a QUOTE rather than a verdict — under the
+ * 2026-07-19 rule a "we do not sponsor" line does not disqualify a STEM OPT
+ * candidate, so the sheet's job is to show the sentence and let him decide, not
+ * to re-litigate the score.
+ *
+ * Absent jd_text yields null rather than "clear". A row whose ad was never
+ * downloaded is UNKNOWN, and saying nothing is the honest rendering of that.
+ */
+function workAuthLine(jdText) {
+  if (!jdText) return null;
+  let c;
+  try { c = classifyText(jdText); } catch { return null; }
+  const parts = [];
+  if (c.verdict === 'blocked' && c.reason) parts.push(`**Ad says:** "${String(c.reason).trim()}" — not a bar on STEM OPT, but read it.`);
+  if (c.clearance) parts.push(`**Clearance:** "${String(c.clearance).trim()}"`);
+  if (c.cohort) parts.push(`**Cohort gate:** "${String(c.cohort).trim()}"`);
+  return parts.length ? parts.join(' · ') : null;
 }
 
 /**
@@ -257,6 +281,15 @@ function checklistFor(allRows, cvs, notes = new Map()) {
     L.push(`      ${cvCell} · [open the posting](${r.canonical_url})`);
     // Indented under the checkbox so it reads as part of that row and cannot be
     // mistaken for a note about the next one.
+    // WORK AUTHORISATION, quoted from the ad, on every row that has any.
+    //
+    // Report 912 said "Sponsorship is not available for this position" and the
+    // report never printed it, so the only way to find out was to open the ad.
+    // Under the 2026-07-19 rule that line does NOT disqualify — STEM OPT is
+    // authorisation without sponsorship — but "does not change the score" was
+    // silently implemented as "does not get shown", and those are different
+    // things. It is quoted here so the decision stays the candidate's.
+    if (r.workAuth) L.push(`      🛂 ${r.workAuth}`);
     const note = notes.get(String(Number(r.report_num)));
     if (note) L.push(`      ⚠️ ${note}`);
   }
@@ -545,12 +578,12 @@ async function main() {
 
   const names = displayNames(join(HERE, 'data', 'applications.md'));
   const notes = applyNotes(join(HERE, 'data', 'apply-notes.md'));
-  const all = db.prepare('SELECT score, company, title, report_num, canonical_url FROM jobs WHERE score IS NOT NULL AND score >= ? ORDER BY score DESC')
+  const all = db.prepare('SELECT score, company, title, report_num, canonical_url, jd_text FROM jobs WHERE score IS NOT NULL AND score >= ? ORDER BY score DESC')
     .all(min)
     .filter((r) => r.report_num != null && !closed.has(String(Number(r.report_num))))
     // Blacklisting matches on the queue's own slug, so swap the display name in
     // only after the row has survived that filter.
-    .map((r) => ({ ...r, slug: r.company, company: names.get(String(Number(r.report_num))) ?? r.company }));
+    .map((r) => ({ ...r, slug: r.company, company: names.get(String(Number(r.report_num))) ?? r.company, workAuth: workAuthLine(r.jd_text) }));
   // Check BOTH names: the ledger may hold "Booz Allen Hamilton" while the queue
   // slug is `bah`, and matching only the slug would let a blacklisted employer
   // through under a name the user never sees.

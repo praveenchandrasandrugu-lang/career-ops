@@ -18,6 +18,20 @@ disk and cost no tokens, so the no-research rule above does not apply to them:
   `**E-Verify:** {ENROLLED | TERMINATED | NOT FOUND}`. TERMINATED is a hard flag:
   say so in the tracker note. NOT FOUND is unknown, never an auto-reject — add
   "ask recruiter: are you enrolled in E-Verify?" to `next_action`.
+- **QUOTE the ad's work-authorization language in the header, always — even when
+  it does not change the score.** Header field
+  `**Work authorization (quoted from the ad):**`, holding the exact sentence, or
+  `none stated` when there is none. Search the whole ad for: sponsorship
+  refusals or offers, "authorized to work", "work authorization", citizenship or
+  permanent-residency demands, and any requirement to MAINTAIN authorization for
+  a term. Report 912 said "Sponsorship is not available for this position" and
+  the report printed nothing, so the only way to find out was to open the ad.
+  Not disqualifying and not shown are different things: a plain "we do not
+  sponsor" line does NOT reduce the score (STEM OPT is authorization without
+  sponsorship) and MUST still be quoted, because the decision is the candidate's.
+  Pair it with the employment type when the ad states one — a fixed-term or
+  terminal appointment combined with "maintain work authorization throughout the
+  employment term" is a real question about term length, not boilerplate.
 - The single WebFetch fallback in Step 1, only when the local JD file failed.
 
 This prompt is self-contained. Do not depend on any slash command, skill, or mode
@@ -160,6 +174,7 @@ lowercase, hyphenated and filesystem-safe.
 **Score:** {X.X/5}
 **Legitimacy:** {High Confidence | Proceed with Caution | Suspicious}
 **E-Verify:** {ENROLLED | TERMINATED | NOT FOUND}
+**Work authorization (quoted from the ad):** {the exact sentence, or `none stated`}
 **URL:** {{URL}}
 **PDF:** {path if generated, otherwise `not generated — run /career-ops pdf {company-slug} to create on demand`}
 **Batch ID:** {{ID}}
