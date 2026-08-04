@@ -16,7 +16,6 @@
  * Usage:
  *   node apply-sheet.mjs                     # publish to the default vault
  *   node apply-sheet.mjs --min 3.0           # include the marginal band (default 3.5: keepers only)
- *   node apply-sheet.mjs --liveness          # re-check every URL first (slow, worth it)
  *   node apply-sheet.mjs --vault D:/notes    # somewhere else
  *   node apply-sheet.mjs --dry-run           # print the plan, write nothing
  *   node apply-sheet.mjs --sync              # read your [x] ticks: mark Applied + write Applied/<date>.md
@@ -136,24 +135,13 @@ function isAnonymous(row) {
   return row.company === '?' || /jobgether/i.test(row.company || '');
 }
 
+// No liveness tier. Removed 2026-08-04 on the user's instruction: the checker
+// called live Workday reqs expired (3 of 3 false), so it deleted real keepers
+// from the sheet and bought nothing. A dead link costs one click to discover;
+// a keeper silently dropped is never seen again.
 function tierOf(row, minKeeper) {
-  if (row.liveness === 'uncertain') return 'uncertain';
   if (isAnonymous(row)) return 'anonymous';
   return row.score >= minKeeper ? 'clean' : 'marginal';
-}
-
-/** Run the real liveness checker rather than trusting a score from hours ago. */
-function checkLiveness(urls) {
-  const res = spawnSync('node', ['check-liveness.mjs', '--throttle=400', ...urls], {
-    cwd: HERE, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-  });
-  const out = `${res.stdout || ''}${res.stderr || ''}`;
-  const status = new Map();
-  for (const line of out.split('\n')) {
-    const m = line.match(/^(✅ active|❌ expired|⚠️ uncertain)\s+(?:\(api\)\s+)?(\S+)/);
-    if (m) status.set(m[2], m[1].includes('active') ? 'active' : m[1].includes('expired') ? 'expired' : 'uncertain');
-  }
-  return status;
 }
 
 const TABLE_HEAD = [
@@ -195,7 +183,7 @@ function tableFor(rows, cvs) {
   return [TABLE_HEAD, ...rows.map((r) => tableRow(r, cvs.get(String(Number(r.report_num)))))].join('\n');
 }
 
-function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan, marginalCap }) {
+function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, marginalCap }) {
   const L = [];
   L.push('---');
   L.push(`date: ${date}`);
@@ -204,14 +192,14 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
   L.push(`clean: ${counts.clean}`);
   L.push(`anonymous: ${counts.anonymous}`);
   L.push(`marginal: ${counts.marginal}`);
-  L.push(`liveness_checked: ${livenessRan}`);
   L.push('tags: [career/apply-sheet]');
   L.push('---');
   L.push('');
   L.push(`# Apply sheet — ${date}`);
   L.push('');
-  L.push(`> [!info] ${counts.total} live targets, all liveness-checked today. Nothing here is submitted.`);
-  L.push(`> Ranked within each group. Expired postings and anything already in the tracker are gone before you see this.`);
+  L.push(`> [!info] ${counts.total} targets. Nothing here is submitted.`);
+  L.push(`> Ranked within each group. Anything already in the tracker is gone before you see this.`);
+  L.push(`> Links are not liveness-checked — if one 404s, that is the check.`);
   L.push('');
 
   if (tiers.clean.length) {
@@ -254,16 +242,7 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, livenessRan
     L.push('');
   }
 
-  if (tiers.uncertain.length) {
-    L.push('## Liveness uncertain');
-    L.push('');
-    L.push('> [!question] The page loaded but no apply control was found. Open it before writing anything.');
-    L.push('');
-    L.push(tableFor(tiers.uncertain, cvs));
-    L.push('');
-  }
-
-  const everyRow = [...tiers.clean, ...tiers.anonymous, ...tiers.marginal, ...tiers.uncertain];
+  const everyRow = [...tiers.clean, ...tiers.anonymous, ...tiers.marginal];
   if (everyRow.length) { L.push(checklistFor(everyRow)); L.push(''); }
 
   L.push('---');
@@ -469,27 +448,15 @@ async function main() {
   const blocked = all.length - rows.length;
   if (blocked) console.error(`blacklist: ${blocked} row(s) held back by data/blacklist.md`);
 
-  // Cap the marginal tail BEFORE the liveness pass, not after. Liveness is one
-  // network round trip per URL and the deep tail is never published, so checking
-  // it first spends minutes proving that rows nobody will read are still open.
-  const preTier = { clean: [], anonymous: [], marginal: [], uncertain: [] };
+  // Cap the marginal tail so the deep, near-identical fill does not bury the
+  // rows above it.
+  const preTier = { clean: [], anonymous: [], marginal: [] };
   for (const r of rows) preTier[tierOf(r, minKeeper)].push(r);
   const marginalTotal = preTier.marginal.length;
   preTier.marginal = preTier.marginal.slice(0, marginalCap);
   rows = [...preTier.clean, ...preTier.anonymous, ...preTier.marginal];
 
-  let livenessRan = false;
-  if (process.argv.includes('--liveness') && rows.length) {
-    const status = checkLiveness(rows.map((r) => r.canonical_url));
-    livenessRan = true;
-    const before = rows.length;
-    rows = rows
-      .map((r) => ({ ...r, liveness: status.get(r.canonical_url) ?? 'unknown' }))
-      .filter((r) => r.liveness !== 'expired');
-    console.error(`liveness: checked ${before}, dropped ${before - rows.length} expired`);
-  }
-
-  const tiers = { clean: [], anonymous: [], marginal: [], uncertain: [] };
+  const tiers = { clean: [], anonymous: [], marginal: [] };
   for (const r of rows) tiers[tierOf(r, minKeeper)].push(r);
   // Restore the true marginal total so the note reports what was omitted, not
   // the post-cap number, which would make a silent truncation look complete.
@@ -500,10 +467,9 @@ async function main() {
     anonymous: tiers.anonymous.length,
     marginal: tiers.marginal.length,
     marginalTotal,
-    uncertain: tiers.uncertain.length,
   };
 
-  const note = buildNote({ date, tiers, counts, minKeeper, outputDir, cvs: cvIndex(outputDir), livenessRan, marginalCap });
+  const note = buildNote({ date, tiers, counts, minKeeper, outputDir, cvs: cvIndex(outputDir), marginalCap });
 
   if (DRY) {
     console.log(JSON.stringify({ ok: true, dryRun: true, vault, counts }, null, 2));

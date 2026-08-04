@@ -1344,7 +1344,18 @@ function guardStatusFor(code) {
 async function main() {
   const args = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
-  const verify = args.includes('--verify');
+  // Liveness checking was removed 2026-08-04 on the user's instruction. The
+  // checker called live Workday reqs expired (3 of 3 false) and silently dropped
+  // real keepers from the scan. The verify subsystem below is left in place
+  // because unrelated code shares its helpers, but it can no longer be reached:
+  // refusing here is the removal, and it fails loudly instead of quietly
+  // ignoring a flag the caller believes is doing something.
+  if (args.includes('--verify')) {
+    console.error('--verify was removed: liveness checking produced false "expired" verdicts and dropped live jobs.');
+    console.error('Re-run without --verify. A dead link costs one click; a dropped keeper is never seen again.');
+    process.exit(2);
+  }
+  const verify = false;
   // Opt-in: on an anti-bot challenge (e.g. pracuj.pl Cloudflare wall), retry the
   // URL in a headed browser. Off by default — headed Chromium needs a display, so
   // scheduled/unattended scans should not rely on it.

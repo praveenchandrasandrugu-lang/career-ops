@@ -27,6 +27,15 @@ import {
 import { checkLivenessViaApi } from './liveness-api.mjs';
 
 async function main() {
+  // REMOVED 2026-08-04 on the user's instruction. Measured: this checker called
+  // 3 of 3 live Workday reqs "expired", because a JS-rendered shell reads as
+  // "insufficient content" without a browser. Every false expired verdict
+  // deletes a real keeper that is never surfaced again, while the only thing a
+  // true verdict saves is one click on a dead link. The trade was never worth it.
+  console.error('check-liveness.mjs was removed: it produced false "expired" verdicts and dropped live jobs.');
+  console.error('Nothing in the pipeline checks liveness any more. Open the link; that is the check.');
+  process.exit(2);
+  /* eslint-disable no-unreachable */
   const args = process.argv.slice(2);
 
   // Portals like pracuj.pl serve a Cloudflare anti-bot wall to headless Chromium.
@@ -107,6 +116,7 @@ async function main() {
 
   console.log(`\nResults: ${active} active  ${expired} expired  ${uncertain} uncertain  (${viaApi} via API, no browser)`);
   if (expired > 0 || uncertain > 0) process.exit(1);
+  /* eslint-enable no-unreachable */
 }
 
 main().catch(err => {

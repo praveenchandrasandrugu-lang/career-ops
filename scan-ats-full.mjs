@@ -22,7 +22,6 @@
  *   node scan-ats-full.mjs --ats greenhouse,workday  # subset of sources
  *   node scan-ats-full.mjs --limit 200          # max companies per ATS (default: all)
  *   node scan-ats-full.mjs --dry-run            # preview without writing files
- *   node scan-ats-full.mjs --liveness           # Playwright-verify matches before writing
  *   node scan-ats-full.mjs --verbose            # log per-board fetch failures
  *   node scan-ats-full.mjs --md-out <dir>       # also write a dated markdown digest to <dir>
  *   node scan-ats-full.mjs --help               # print this usage block and exit
@@ -122,7 +121,7 @@ const SOURCES = {
 // ── CLI args ────────────────────────────────────────────────────────
 
 const KNOWN_FLAGS = [
-  '--since', '--limit', '--ats', '--seeds', '--dry-run', '--liveness',
+  '--since', '--limit', '--ats', '--seeds', '--dry-run',
   '--verbose', '--md-out', '--json', '--include-undated', '--shuffle',
   '--help', '-h',
 ];
@@ -137,7 +136,6 @@ const USAGE = `Usage:
   node scan-ats-full.mjs --ats greenhouse,workday  # subset of sources
   node scan-ats-full.mjs --limit 200          # max companies per ATS (default: all)
   node scan-ats-full.mjs --dry-run            # preview without writing files
-  node scan-ats-full.mjs --liveness           # Playwright-verify matches before writing
   node scan-ats-full.mjs --verbose            # log per-board fetch failures
   node scan-ats-full.mjs --md-out <dir>       # also write a dated markdown digest to <dir>
   node scan-ats-full.mjs --help               # print this usage block and exit`;
@@ -205,7 +203,6 @@ function parseArgs(argv) {
     ats,
     seeds,
     dryRun: args.includes('--dry-run'),
-    liveness: args.includes('--liveness'),
     verbose: args.includes('--verbose'),
     mdOut: valueOf('--md-out'),
     json: args.includes('--json'),
@@ -366,38 +363,6 @@ async function parallelEach(items, limit, fn) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
 }
 
-// ── Liveness verification (reuses liveness-browser.mjs) ────────────
-
-async function filterLive(offers) {
-  let chromium, checkUrlLiveness, newLivenessPage;
-  try {
-    ({ chromium } = await import('playwright'));
-    ({ checkUrlLiveness, newLivenessPage } = await import('./liveness-browser.mjs'));
-  } catch (err) {
-    throw new Error(
-      `--liveness requires Playwright with Chromium (run "npx playwright install chromium"): ${err.message}`,
-      { cause: err },
-    );
-  }
-  console.error(`\nVerifying liveness of ${offers.length} match(es) with Playwright (sequential)...`);
-  const browser = await chromium.launch({ headless: true });
-  const live = [];
-  try {
-    const page = await newLivenessPage(browser);
-    // Sequential — project rule: never Playwright in parallel
-    for (const offer of offers) {
-      const { result, reason } = await checkUrlLiveness(page, offer.url);
-      const icon = result === 'active' ? '✅' : result === 'expired' ? '❌' : '⚠️';
-      console.error(`  ${icon} ${result.padEnd(9)} ${offer.company} | ${offer.title}${result === 'expired' ? ` (${reason})` : ''}`);
-      if (result !== 'expired') live.push(offer); // keep 'uncertain' — transient errors retry next scan
-    }
-  } finally {
-    await browser.close();
-  }
-  console.error(`  → ${live.length}/${offers.length} passed liveness`);
-  return live;
-}
-
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
@@ -425,7 +390,7 @@ async function main() {
   const atsSummary = opts.ats.length ? `ats: ${opts.ats.join(', ')}` : '';
   const seedsSummary = opts.seeds.length ? `seeds: ${opts.seeds.join(', ')}` : '';
   const sourcesSummary = [atsSummary, seedsSummary].filter(Boolean).join(' | ');
-  log(`Reverse ATS scan — ${sourcesSummary} | since ${opts.sinceDays}d${opts.limit < Infinity ? ` | limit ${opts.limit}/ats` : ''}${opts.shuffle ? ' | shuffled' : ''}${opts.includeUndated ? ' | +undated' : ''}${opts.liveness ? ' | liveness' : ''}${opts.dryRun ? ' | DRY RUN' : ''}`);
+  log(`Reverse ATS scan — ${sourcesSummary} | since ${opts.sinceDays}d${opts.limit < Infinity ? ` | limit ${opts.limit}/ats` : ''}${opts.shuffle ? ' | shuffled' : ''}${opts.includeUndated ? ' | +undated' : ''}${opts.dryRun ? ' | DRY RUN' : ''}`);
 
   const { seen: seenUrls } = loadSeenUrls();
   await loadQueueSeenUrls(seenUrls); // fold the SQLite queue in as a dedup source
@@ -517,7 +482,6 @@ async function main() {
   }
 
   let offers = newOffers;
-  if (offers.length && opts.liveness) offers = await filterLive(newOffers);
   offers.sort((a, b) => (b.postedAt || 0) - (a.postedAt || 0));
 
   log(`\n${'━'.repeat(45)}`);
@@ -576,7 +540,7 @@ async function main() {
         mkdirSync(opts.mdOut, { recursive: true });
         const digest = [
           `# Reverse ATS Scan — ${date}`,
-          `> ${offers.length} jobs | since ${opts.sinceDays}d | ${opts.liveness ? 'liveness ✓' : 'no liveness check'}`,
+          `> ${offers.length} jobs | since ${opts.sinceDays}d | no liveness check`,
           '',
           ...offers.map(o => {
             const posted = o.postedAt ? new Date(o.postedAt).toISOString().slice(0, 10) : 'n/a';

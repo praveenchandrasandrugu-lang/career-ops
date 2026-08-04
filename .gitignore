@@ -166,3 +166,6 @@ tmp/
 .tmp/
 # Personal do-not-apply ledger: employer names, user layer, never published.
 data/blacklist.md
+
+# Playwright scratch dirs (leaked temp profiles/artifacts)
+.pw-tmp/
