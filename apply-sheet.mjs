@@ -80,6 +80,59 @@ function closedReportNums(trackerPath) {
 }
 
 /**
+ * Human company names, indexed by report number, read from the tracker.
+ *
+ * queue.db stores whatever the ATS called the tenant, which is a URL slug, not a
+ * name: `wisconsin` for UW-Stout, `rb` for the New York Fed, `bah` for Booz Allen,
+ * `roberthalf`, `lightspeedsystems`. Those are fine as join keys and bad on a page
+ * a person reads while deciding where to send a CV. The tracker row carries the
+ * name written into the report header, so prefer it and fall back to the slug.
+ */
+function displayNames(trackerPath) {
+  const byReport = new Map();
+  if (!existsSync(trackerPath)) return byReport;
+  for (const line of readFileSync(trackerPath, 'utf8').split('\n')) {
+    if (!line.startsWith('|')) continue;
+    const cells = line.split('|').map((c) => c.trim());
+    // | # | Date | Company | Role | ... — cells[0] is the empty pre-pipe string.
+    const num = cells[1];
+    const company = cells[3];
+    if (!/^\d+$/.test(num) || !company || company === '?') continue;
+    byReport.set(String(Number(num)), company);
+    const link = line.match(/reports\/(\d+)-/);
+    if (link) byReport.set(String(Number(link[1])), company);
+  }
+  return byReport;
+}
+
+/**
+ * Per-role warnings from data/apply-notes.md, indexed by report number.
+ *
+ * A score cannot say "this application needs a screen recording attached" or
+ * "the eligibility clause here is ambiguous, read it yourself". Those used to
+ * live only in the chat message that accompanied a run, which meant they were
+ * gone by the next morning while the sheet they applied to was still open.
+ *
+ * User layer, opt-in, never auto-written: absent file = no notes.
+ */
+function applyNotes(path) {
+  const byReport = new Map();
+  if (!existsSync(path)) return byReport;
+  for (const raw of readFileSync(path, 'utf8').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = /^(\d+)\s*:\s*(.+)$/.exec(line);
+    if (!m) continue;
+    const key = String(Number(m[1]));
+    // Repeating the number continues the note rather than replacing it, so a
+    // long warning can be wrapped across lines instead of running off the page.
+    const prev = byReport.get(key);
+    byReport.set(key, prev ? `${prev} ${m[2].trim()}` : m[2].trim());
+  }
+  return byReport;
+}
+
+/**
  * Tailored CVs on disk, indexed by every report number in the filename.
  *
  * One PDF can serve several near-identical reqs, and those are named for all of
@@ -89,10 +142,16 @@ function cvIndex(outputDir) {
   const byReport = new Map();
   if (!existsSync(outputDir)) return byReport;
   for (const f of readdirSync(outputDir)) {
-    if (!f.startsWith('cv-candidate-') || !f.endsWith('.pdf')) continue;
-    const ids = f.slice('cv-candidate-'.length).split('-');
-    for (const part of ids) {
-      if (!/^\d+$/.test(part)) break; // the numeric run ends where the slug starts
+    if (!f.endsWith('.pdf')) continue;
+    // TWO naming conventions, both live, and matching only the first one is why
+    // a freshly built CV used to show as "none yet" on the sheet:
+    //   cv-candidate-943-slug.pdf   the batch scorer's output
+    //   cv-943-slug.pdf             a directly rendered CV
+    // A leading numeric run identifies the report(s); one file can cover several
+    // (cv-candidate-774-768-761-ml-ai-engineer.pdf is one CV for three reqs).
+    const m = /^cv-(?:candidate-)?(\d+(?:-\d+)*)-/.exec(f);
+    if (!m) continue;
+    for (const part of m[1].split('-')) {
       const key = String(Number(part));
       // Newest wins: a rebuilt CV should replace yesterday's for the same req.
       const prev = byReport.get(key);
@@ -149,11 +208,14 @@ const TABLE_HEAD = [
   '|------:|---------|------|------------------------|-------:|-------|',
 ].join('\n');
 
+/** Scores are a one-decimal scale; 4 must read as 4.0 or the column looks ragged. */
+const fmtScore = (v) => (Number.isFinite(Number(v)) ? Number(v).toFixed(1) : String(v ?? '?'));
+
 function tableRow(row, cvFile) {
   const cell = (v) => String(v ?? '').replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
   const company = row.company === '?' ? '**?** _(not named)_' : cell(row.company);
   const cv = cvFile ? `\`${cvFile}\`` : '**none yet**';
-  return `| **${row.score}** | ${company} | ${cell(row.title)} | ${cv} | ${Number(row.report_num)} | [open](${row.canonical_url}) |`;
+  return `| **${fmtScore(row.score)}** | ${company} | ${cell(row.title)} | ${cv} | ${Number(row.report_num)} | [open](${row.canonical_url}) |`;
 }
 
 
@@ -167,14 +229,36 @@ function tableRow(row, cvFile) {
  * detail is thirty lines up and duplicating it twice invites the two copies to
  * disagree.
  */
-function checklistFor(allRows) {
+/**
+ * The one place with real, tickable checkboxes — and now the only section you
+ * need. Obsidian renders an interactive checkbox for a LIST item and never
+ * inside a table cell, so the table above can show everything but stays dead,
+ * and this list is where the work actually happens. Previously it carried only
+ * the report number, company and role, which meant ticking a box required
+ * scrolling back up to the table for the apply link and the CV filename. Every
+ * field needed to send an application now lives on the line you tick: score,
+ * company, role, the exact PDF to attach, and the link.
+ */
+function checklistFor(allRows, cvs, notes) {
   const L = ['## Mark as sent', '',
-    '> [!tip] Click a box as you submit, then run `node apply-sheet.mjs --sync`.',
+    '> [!tip] Everything you need is on the line. Attach the CV named there, open the link,',
+    '> tick the box as you submit, then run `node apply-sheet.mjs --sync`.',
     '> That marks each one Applied in the tracker, seeds its follow-up date, and files it',
     '> under `Applied/` for the day.', ''];
   for (const r of allRows) {
     const title = String(r.title ?? '').replace(/\s+/g, ' ').trim();
-    L.push(`- [ ] \`${Number(r.report_num)}\` ${r.company === '?' ? '(employer not named)' : r.company} — ${title}`);
+    const company = r.company === '?' ? '(employer not named)' : r.company;
+    const cv = cvs.get(String(Number(r.report_num)));
+    // A missing CV is called out on the line rather than left blank. Since
+    // 2026-08-04 every keeper at or above the threshold should have one, so a
+    // blank here is a bug to fix, not a normal state to skim past.
+    const cvCell = cv ? `\`${cv}\`` : '**NO CV — build one before sending**';
+    L.push(`- [ ] **${fmtScore(r.score)}** \`${Number(r.report_num)}\` **${company}** — ${title}`);
+    L.push(`      ${cvCell} · [open the posting](${r.canonical_url})`);
+    // Indented under the checkbox so it reads as part of that row and cannot be
+    // mistaken for a note about the next one.
+    const note = notes.get(String(Number(r.report_num)));
+    if (note) L.push(`      ⚠️ ${note}`);
   }
   return L.join('\n');
 }
@@ -183,7 +267,7 @@ function tableFor(rows, cvs) {
   return [TABLE_HEAD, ...rows.map((r) => tableRow(r, cvs.get(String(Number(r.report_num)))))].join('\n');
 }
 
-function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, marginalCap }) {
+function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, notes, marginalCap }) {
   const L = [];
   L.push('---');
   L.push(`date: ${date}`);
@@ -243,7 +327,18 @@ function buildNote({ date, tiers, counts, minKeeper, outputDir, cvs, marginalCap
   }
 
   const everyRow = [...tiers.clean, ...tiers.anonymous, ...tiers.marginal];
-  if (everyRow.length) { L.push(checklistFor(everyRow)); L.push(''); }
+  // Keepers with no CV, surfaced as a block rather than left as a quiet blank.
+  // The 3.5+ auto-CV rule (2026-08-04) means this list should always be empty;
+  // if it is not, the sheet says so instead of letting you find out mid-apply.
+  const missingCv = everyRow.filter((r) => !cvs.get(String(Number(r.report_num))));
+  if (missingCv.length) {
+    L.push('> [!warning] ' + `${missingCv.length} keeper(s) have no CV in \`output/\``);
+    L.push('> Every keeper at or above the threshold is supposed to have one. Build these before sending:');
+    for (const r of missingCv) L.push(`> - \`${Number(r.report_num)}\` ${r.company} — ${String(r.title ?? '').trim()}`);
+    L.push('');
+  }
+
+  if (everyRow.length) { L.push(checklistFor(everyRow, cvs, notes)); L.push(''); }
 
   L.push('---');
   L.push(`_Generated by \`apply-sheet.mjs\` on ${date}._`);
@@ -331,7 +426,7 @@ function writeAppliedNote(vault, date, results) {
     L.push('|------:|---------|------|---------|-------:|---------|');
   }
   for (const r of fresh) {
-    L.push(`| ${r.score} | ${r.company} | ${r.title} | \`${r.cv}\` | ${r.report} | [open](${r.url}) |`);
+    L.push(`| ${fmtScore(r.score)} | ${r.company} | ${r.title} | \`${r.cv}\` | ${r.report} | [open](${r.url}) |`);
   }
   if (failed.length) {
     L.push('', '> [!failure] Not recorded in the tracker, needs a look');
@@ -441,10 +536,15 @@ async function main() {
 
   const blacklisted = blacklistMatcher(join(HERE, 'data', 'blacklist.md'));
 
+  const names = displayNames(join(HERE, 'data', 'applications.md'));
+  const notes = applyNotes(join(HERE, 'data', 'apply-notes.md'));
   const all = db.prepare('SELECT score, company, title, report_num, canonical_url FROM jobs WHERE score IS NOT NULL AND score >= ? ORDER BY score DESC')
     .all(min)
-    .filter((r) => r.report_num != null && !closed.has(String(Number(r.report_num))));
-  let rows = all.filter((r) => !blacklisted(r.company));
+    .filter((r) => r.report_num != null && !closed.has(String(Number(r.report_num))))
+    // Blacklisting matches on the queue's own slug, so swap the display name in
+    // only after the row has survived that filter.
+    .map((r) => ({ ...r, slug: r.company, company: names.get(String(Number(r.report_num))) ?? r.company }));
+  let rows = all.filter((r) => !blacklisted(r.slug));
   const blocked = all.length - rows.length;
   if (blocked) console.error(`blacklist: ${blocked} row(s) held back by data/blacklist.md`);
 
@@ -469,7 +569,7 @@ async function main() {
     marginalTotal,
   };
 
-  const note = buildNote({ date, tiers, counts, minKeeper, outputDir, cvs: cvIndex(outputDir), marginalCap });
+  const note = buildNote({ date, tiers, counts, minKeeper, outputDir, cvs: cvIndex(outputDir), notes, marginalCap });
 
   if (DRY) {
     console.log(JSON.stringify({ ok: true, dryRun: true, vault, counts }, null, 2));
