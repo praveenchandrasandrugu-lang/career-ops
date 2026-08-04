@@ -244,6 +244,19 @@ node generate-pdf.mjs \
 Apply every CV rule in `modes/_custom.md` → Output Preferences before rendering. Those
 are his standing instructions and they override any default.
 
+**A render failure is not a hard gate.** `verify-cv-facts.mjs` is one; `generate-pdf.mjs`
+is not. If the render exits non-zero for an environment reason — sandboxed Chromium
+refusing to spawn (`EPERM`), a missing browser binary, a platform-channel "access is
+denied", a WeasyPrint fallback with an unmet library — do **not** emit the failure JSON.
+Fall back to the below-threshold path instead: write the `not generated` note in the
+header, `❌` in the TSV, `"pdf": null` in the JSON, and finish the row normally.
+
+The reason is asymmetry of cost. The evaluation is the expensive artefact and by this
+point it is already done and verified; a PDF is a render of `cv.md` that can be produced
+later on demand in a second. Failing the row throws the evaluation away, returns it to
+`llm_ready`, and buys a retry that hits the identical environment failure — so the rows
+this destroys are exactly the ones that scored above the threshold.
+
 Then write exactly one line to `batch/tracker-additions/{{ID}}.tsv`, no header, 9
 tab-separated columns:
 
