@@ -57,14 +57,22 @@ live queue were rejected the expensive way before this ordering existed.
 input cost. On the live queue these are the two most common hard rejects (29
 citizenship/clearance, 31 non-US in the last screen pass):
 
-- A work-authorization bar he fails. Resolve his actual status from
-  `config/profile.yml` first; do not assume. **The distinction matters and getting it
-  backwards throws away good jobs:** on F-1 STEM OPT he is already work-authorized
-  without sponsorship, so a plain "we do not sponsor" line is **NOT** a reject and
-  must be scored. What IS a reject is a demand he cannot satisfy at all — US
-  citizenship, permanent residency, "permanent/unrestricted work authorization", or a
-  security clearance in any form, **including one the ad says is obtainable after
-  hire**, since obtaining a US clearance requires citizenship.
+- A work-authorization bar. **REVERSED 2026-08-04 on the candidate's explicit
+  instruction: a declarative refusal to sponsor is now a HARD REJECT.** Any of
+  "Sponsorship is not available for this position", "we do not sponsor", "unable to
+  provide sponsorship now or in the future" → emit the `skipped` payload and STOP.
+  This is a change from the previous rule, which said such lines must still be
+  scored because F-1 STEM OPT is authorization without sponsorship. That reasoning
+  still holds legally; he has chosen not to act on it, and he was shown the measured
+  cost (7.1% of ads, 21% of keepers) before deciding. Do not second-guess it and do
+  not score the row anyway.
+  Also still a reject, as before: US citizenship, permanent residency,
+  "permanent/unrestricted work authorization", or a security clearance in any form,
+  **including one the ad says is obtainable after hire**, since obtaining a US
+  clearance requires citizenship.
+  **Not a reject:** an ad that is merely silent on sponsorship, or a form-style
+  question ("will you require sponsorship?") that sponsoring employers also ask.
+  Silence is not a refusal — only a declarative statement counts.
 - The role is not in the United States.
 
 **Stage 2 — needs the CV.** Only if Stage 1 found nothing, read `cv.md` (Step 2 needs
